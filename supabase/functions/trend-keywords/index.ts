@@ -1,4 +1,5 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { cleanInputs, isSafeOutput } from "../_shared/safety.ts";
 
 // F-OVNIBD · 실시간 트렌드 기반 "키워드" 카드 생성
 //
@@ -70,6 +71,7 @@ Deno.serve(async (req: Request) => {
     likedKeywords?: string[];
     seenKeywords?: string[];
     doneProjects?: string[];
+    savedCards?: string[];
     count?: number;
   };
   try {
@@ -78,10 +80,12 @@ Deno.serve(async (req: Request) => {
     return json({ error: "invalid_json" }, 400);
   }
 
-  const interests = (payload.interests ?? []).slice(0, 5);
-  const liked = (payload.likedKeywords ?? []).slice(0, 15);
-  const seen = (payload.seenKeywords ?? []).slice(0, 40);
-  const doneProjects = (payload.doneProjects ?? []).slice(0, 10);
+  // 사용자가 직접 친 '기타' 관심사가 여기 섞여 들어온다. 그대로 프롬프트에 넣지 않는다.
+  const interests = cleanInputs(payload.interests, 20, 5);
+  const liked = cleanInputs(payload.likedKeywords, 30, 15);
+  const seen = cleanInputs(payload.seenKeywords, 30, 40);
+  const doneProjects = cleanInputs(payload.doneProjects, 60, 10);
+  const savedCards = cleanInputs(payload.savedCards, 40, 12);
   const count = Math.min(Math.max(payload.count ?? 5, 1), 8);
 
   const trends = await fetchTrends();
@@ -92,7 +96,7 @@ Deno.serve(async (req: Request) => {
    */
   const plan: string[] = [];
   const hasHistory = doneProjects.length > 0;
-  const hasLiked = liked.length > 0;
+  const hasLiked = liked.length > 0 || savedCards.length > 0;
 
   if (hasHistory) plan.push("나의 궤적", "나의 궤적");
   if (hasLiked) plan.push("취향 심화");
@@ -125,13 +129,14 @@ Deno.serve(async (req: Request) => {
     "",
     "카드마다 정해진 소스가 있다. 소스를 지켜서 만들고 reason 에 그 소스를 밝힌다:",
     "- 나의 궤적 → 사용자가 이미 끝낸 프로젝트에서 자연스럽게 이어질 다음 주제. reason: '끝낸 프로젝트에서 이어져 · <프로젝트 제목>'",
-    "- 취향 심화 → 좋아요한 키워드보다 한 단계 깊거나 구체적인 키워드. reason: '좋아한 <키워드>에서 한 걸음 더'",
+    "- 취향 심화 → 좋아요한 키워드나 관심 카드함에 보관 중인 카드보다 한 단계 깊거나 구체적인 키워드. reason: '좋아한 <키워드>에서 한 걸음 더'",
     "- 실시간 트렌드 → 지금 검색되는 말에서 배울 거리로 옮긴 것. reason: '실시간 트렌드 · <원본 검색어>'",
     "- 넓히기 → 아직 반응이 없던 분야에서 하나. reason: '아직 안 본 분야 · <분야>'",
   ].join("\n");
 
   const user = [
     doneProjects.length ? `사용자가 끝낸 프로젝트: ${doneProjects.join(" / ")}` : "",
+    savedCards.length ? `관심 카드함에 보관 중인 카드: ${savedCards.join(" / ")}` : "",
     interests.length ? `사용자가 고른 관심 분야: ${interests.join(", ")}` : "",
     liked.length ? `사용자가 좋아요한 키워드: ${liked.join(", ")}` : "",
     trends.length ? `지금 한국에서 실시간으로 많이 검색되는 말: ${trends.join(", ")}` : "",
@@ -190,6 +195,11 @@ Deno.serve(async (req: Request) => {
       const keyword = String(c?.keyword ?? "").trim().slice(0, 20);
       if (!keyword) return null;
       const category = CATEGORIES.includes(String(c?.category)) ? String(c.category) : "기타";
+      // 프롬프트 규칙을 어긴 결과가 화면과 DB 로 나가지 않게 마지막으로 한 번 더 거른다.
+      if (!isSafeOutput(keyword, c?.intro, c?.easy, c?.reason)) {
+        console.warn("blocked_output", keyword);
+        return null;
+      }
       return {
         slug: slugify(keyword, i),
         keyword,

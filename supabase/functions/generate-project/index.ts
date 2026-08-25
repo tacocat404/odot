@@ -1,4 +1,5 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { cleanInput, cleanInputs, isSafeOutput } from "../_shared/safety.ts";
 
 // F-PEBLKV · AI 프로젝트 할 일 목록 생성
 // OpenAI 키는 Edge Function 시크릿에만 존재한다. 클라이언트로 절대 내려가지 않는다.
@@ -44,6 +45,9 @@ Deno.serve(async (req: Request) => {
     likedTitles?: string[];
     goal?: string;
     taskCount?: number;
+    survey?: { q?: string; a?: string }[];
+    cards?: { title?: string; intro?: string }[];
+    days?: number;
   };
   try {
     payload = await req.json();
@@ -55,9 +59,20 @@ Deno.serve(async (req: Request) => {
   const category = CATEGORIES.includes(payload.category ?? "")
     ? payload.category!
     : "기타";
-  const interests = (payload.interests ?? []).slice(0, 5);
-  const likedTitles = (payload.likedTitles ?? []).slice(0, 10);
-  const goal = String(payload.goal ?? "").trim().slice(0, 60);
+  const interests = cleanInputs(payload.interests, 20, 5);
+  const likedTitles = cleanInputs(payload.likedTitles, 40, 10);
+  const goal = cleanInput(payload.goal, 60) ?? "";
+  // 할 일이 뜬구름 잡지 않으려면 재료가 필요하다.
+  // 설문 답(쓸 수 있는 시간·중단 이유), 이 프로젝트를 만든 카드의 설명, 실제 기간.
+  const survey = (payload.survey ?? [])
+    .map((item) => ({ q: cleanInput(item?.q, 80), a: cleanInput(item?.a, 40) }))
+    .filter((item): item is { q: string; a: string } => Boolean(item.q && item.a))
+    .slice(0, 8);
+  const cards = (payload.cards ?? [])
+    .map((c) => ({ title: cleanInput(c?.title, 40), intro: cleanInput(c?.intro, 120) }))
+    .filter((c): c is { title: string; intro: string } => Boolean(c.title))
+    .slice(0, 5);
+  const days = Number.isFinite(payload.days) ? Math.min(Math.max(Number(payload.days), 1), 400) : null;
   // 호출자가 개수를 지정할 수 있다. 프로젝트 카드의 단계 수와 정확히 맞춰야 하기 때문이다.
   const taskCount = Number.isInteger(payload.taskCount)
     ? Math.min(Math.max(payload.taskCount!, 1), 8)
@@ -70,6 +85,14 @@ Deno.serve(async (req: Request) => {
     "규칙:",
     "- 반드시 한국어로 쓴다. 초등학생도 이해할 수 있는 쉬운 문장을 쓴다.",
     "- 할 일은 실행 순서대로 배열하고, 각 항목은 한 문장(40자 이내)으로 쓴다.",
+    "",
+    "구체적으로 쓰는 규칙(가장 중요):",
+    "- 각 할 일에는 '무엇을'이 반드시 들어간다. 대상을 이름으로 부른다. '자료를 찾는다'가 아니라 '누리호 발사 영상 2편을 고른다'.",
+    "- 각 할 일에는 분량이나 시간이 들어간다. 몇 개, 몇 쪽, 몇 분 중 하나는 반드시 밝힌다.",
+    "- '알아본다', '살펴본다', '공부한다', '연습한다' 처럼 무엇을 얼마나 하는지 알 수 없는 서술어만으로 끝내지 않는다.",
+    "- 첫 할 일은 앉은 자리에서 30분 안에 끝낼 수 있어야 한다. 시작 문턱을 낮춘다.",
+    "- 사용자가 쓸 수 있다고 답한 시간을 넘지 않게 분량을 정한다.",
+    "- '이 프로젝트를 만든 카드'가 주어지면 그 카드의 주제를 할 일 안에서 실제로 다룬다.",
     "",
     "문장이 서로 닮지 않게 하는 규칙(중요):",
     "- 단계마다 역할이 다르다. 준비 → 실행 → 점검 → 남기기 순서를 따르되, 매번 같은 틀로 쓰지 않는다.",
@@ -86,8 +109,14 @@ Deno.serve(async (req: Request) => {
   const user = [
     goal ? `사용자가 고른 목표: ${goal}` : "",
     goal ? "할 일은 이 목표를 끝내기 위한 단계여야 한다. 목표와 무관한 일반적인 할 일을 쓰지 않는다." : "",
-    `수행 기간: ${duration}`,
+    days ? `마감까지 ${days}일` : `수행 기간: ${duration}`,
     `대표 카테고리: ${category}`,
+    cards.length
+      ? ["이 프로젝트를 만든 카드:", ...cards.map((c) => `- ${c.title}: ${c.intro}`)].join("\n")
+      : "",
+    survey.length
+      ? ["설문 답변:", ...survey.map((item) => `- ${item.q} → ${item.a}`)].join("\n")
+      : "",
     interests.length ? `사용자가 고른 관심 분야: ${interests.join(", ")}` : "",
     likedTitles.length
       ? `사용자가 관심을 표시한 주제: ${likedTitles.join(" / ")}`
@@ -152,6 +181,7 @@ Deno.serve(async (req: Request) => {
       content: String(t?.content ?? "").slice(0, 120),
       suggested_when: String(t?.suggested_when ?? "").slice(0, 40),
       position: i,
-    })).filter((t: { content: string }) => t.content.length > 0),
+    })).filter((t: { content: string; suggested_when: string }) =>
+      t.content.length > 0 && isSafeOutput(t.content, t.suggested_when)),
   });
 });

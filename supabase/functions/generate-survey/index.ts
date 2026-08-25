@@ -1,4 +1,5 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { cleanInputs, isSafeOutput } from "../_shared/safety.ts";
 
 // F-URTMLV · 좋아요한 키워드로 분기 설문 문항 만들기
 //
@@ -41,8 +42,8 @@ Deno.serve(async (req: Request) => {
     return json({ error: "invalid_json" }, 400);
   }
 
-  const keywords = (payload.keywords ?? []).filter(Boolean).slice(0, 10);
-  const categories = (payload.categories ?? []).filter(Boolean).slice(0, 5);
+  const keywords = cleanInputs(payload.keywords, 30, 10);
+  const categories = cleanInputs(payload.categories, 20, 5);
   if (!keywords.length) return json({ error: "no_keywords" }, 400);
 
   const system = [
@@ -123,6 +124,7 @@ Deno.serve(async (req: Request) => {
         : [];
       // 화면이 보기 4개를 그리므로 개수가 어긋나면 버린다.
       if (!q || options.length !== 4) return null;
+      if (!isSafeOutput(q, ...options)) { console.warn("blocked_question", q); return null; }
       return { q, options };
     })
     .filter(Boolean)

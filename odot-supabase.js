@@ -51,6 +51,16 @@ const Cloud = {
       .filter(Boolean);
     return [...new Set([...archived, ...finished])].slice(0, 10);
   },
+  /**
+   * 프로필 관심 카드함에 보관 중인 카드 (추천의 "취향 심화" 재료).
+   * 좋아요는 했지만 아직 프로젝트로 쓰지 않은, 지금도 살아 있는 관심이다.
+   */
+  savedCards() {
+    const cards = globalThis.Storage?.read?.()?.cardStore?.cards || [];
+    return [...new Set(cards.map((c) => String(c.title || '').replace('\n', ' ').trim()))]
+      .filter(Boolean)
+      .slice(0, 12);
+  },
   /** 좋아요한 카드의 키워드 목록 (to-do 생성의 재료) */
   likedKeywords() {
     const reactions = globalThis.Storage?.read?.()?.reactions || [];
@@ -408,6 +418,38 @@ function applySurvey() {
   return true;
 }
 
+/**
+ * 사용자가 직접 친 '기타' 관심사 검사.
+ * 이 문자열은 그대로 AI 프롬프트에 들어가므로, 부적절한 말과
+ * 프롬프트를 가로채려는 문장을 여기서 먼저 막는다. (서버에서 한 번 더 막는다.)
+ */
+const BLOCKED_INPUT = [
+  '시발', '씨발', 'ㅅㅂ', '병신', 'ㅂㅅ', '지랄', '좆', '새끼', '개새', '썅',
+  '섹스', '야동', '포르노', '자위', '조건만남', '성매매',
+  '마약', '대마', '술먹', '음주', '소주', '담배', '흡연', '도박', '토토', '카지노',
+  '자살', '자해', '죽여', '죽고싶', '살인', '폭행', '테러',
+  '한남', '김치녀', '틀딱', '급식충', '맘충', '굶기', '먹토', '프로아나',
+  'fuck', 'shit', 'porn', 'sex', 'suicide',
+];
+const INJECTION_INPUT = [
+  /이전\s*(의)?\s*(지시|명령|규칙)/, /무시\s*(하고|해|하라|해라)/,
+  /시스템\s*(프롬프트|메시지)/, /너는\s*이제/, /역할을?\s*(바꿔|변경)/,
+  /ignore\s+(all\s+|the\s+)?(previous|above)/i, /system\s*(prompt|message)/i,
+  /you\s+are\s+now/i, /jailbreak/i,
+];
+
+function checkCustomInterest(raw) {
+  const text = String(raw || '').trim();
+  const squashed = text.toLowerCase().replace(/[\s._\-*+/\\|()[\]{}'"`~!@#$%^&,?:;<>]/g, '');
+  if (BLOCKED_INPUT.some((t) => squashed.includes(t.toLowerCase().replace(/\s/g, '')))) {
+    return '이 서비스에서 쓸 수 없는 말이에요. 다른 관심사를 적어 주세요.';
+  }
+  if (INJECTION_INPUT.some((p) => p.test(text))) {
+    return '관심사만 짧게 적어 주세요.';
+  }
+  return null;
+}
+
 /** F-URTMLV · 설문 답변 + 좋아요한 키워드 → 카테고리별 목표 후보 */
 async function generateGoalsViaAI({ categories, keywords, survey }) {
   const data = await invoke('generate-goals', { categories, keywords, survey });
@@ -591,6 +633,7 @@ async function fetchKeywordCards(count) {
     likedKeywords: Cloud.likedKeywords(),
     seenKeywords: [...Cloud.keywordBySlug.values()].slice(-40),
     doneProjects: Cloud.doneProjects(),
+    savedCards: Cloud.savedCards(),
     count,
   });
   if (!data?.cards?.length) return [];
@@ -798,6 +841,13 @@ function attach() {
     .kw-label{margin:0;color:var(--muted);font-size:11px;font-weight:900;letter-spacing:.14em}
     .kw-word{margin:0;font-size:40px;line-height:1.08;letter-spacing:-1.6px;word-break:keep-all}
     @media (max-width:380px){.kw-word{font-size:33px}}
+    .origin-card-list{display:flex;flex-direction:column;gap:6px;margin:0 10px 12px;padding:0;list-style:none}
+    .origin-card-list li{display:flex;flex-direction:column;gap:2px;padding:9px 11px;
+      border:1px solid color-mix(in srgb,var(--project-color) 22%,var(--line));
+      border-radius:12px;background:#fff}
+    .origin-card-list b{font-size:12.5px;letter-spacing:-.2px}
+    .origin-card-list span{color:var(--muted);font-size:11px;line-height:1.45}
+    .origin-card-list small{color:var(--project-color);font-size:10px;font-weight:800}
   `;
   document.head.append(keywordStyle);
 
@@ -816,6 +866,26 @@ function attach() {
   /* ── 계정 화면: 하드코딩 데모 로그인을 실제 인증으로 교체 ──────────
      기존 화면은 demo@odot.app / odot1234 를 문자열로 비교하기만 했다. */
   installAuthScreen();
+
+  // '기타' 직접 입력 검사. 기존에는 길이만 봤다.
+  const customBtn = document.querySelector('#addCustomInterest');
+  const customInput = document.querySelector('#customInterest');
+  if (customBtn && customInput) {
+    const baseAdd = customBtn.onclick;
+    customBtn.onclick = () => {
+      const problem = checkCustomInterest(customInput.value);
+      if (problem) {
+        const help = document.querySelector('#customHelp');
+        if (help) help.textContent = problem;
+        return;
+      }
+      baseAdd?.call(customBtn);
+    };
+    // 엔터로도 추가되므로 같은 검사를 태운다.
+    customInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); customBtn.onclick(); }
+    });
+  }
 
   function installAuthScreen() {
     const card = document.querySelector('#login .auth-card');
@@ -1152,13 +1222,25 @@ function attach() {
     const interests = Cloud.interests();
     const keywords = Cloud.likedKeywords();
 
+    // 할 일이 구체적으로 나오려면 재료가 필요하다.
+    // 설문 답(쓸 수 있는 시간), 이 목표를 만든 카드의 설명, 실제 남은 일수를 함께 넘긴다.
+    const survey = surveyAnswers();
+    const PERIOD_DAYS = { 단기: 7, 중기: 28, 장기: 84 };
+
     const results = await Promise.all(picks.map(async (pick) => {
       const period = pick.goal?.[1];
+      const cards = (globalThis.state?.decisionLikes || [])
+        .filter((c) => c.category === pick.category)
+        .map((c) => ({ title: String(c.title || '').replace('\n', ' '), intro: c.intro || '' }));
+
       const ai = await generateProjectViaAI({
         category: pick.category,
         duration: PERIOD_TO_DURATION[period] || '1주',
         interests,
         likedTitles: keywords,
+        survey,
+        cards,
+        days: PERIOD_DAYS[period] || 7,
         goal: pick.goal?.[0],
         // 카드의 단계 수는 Catalog.projects 의 항목 수(3)를 따른다. 개수가 어긋나면
         // applyStoredTasks 가 적용을 건너뛰어 하드코딩 문구가 그대로 남는다.
@@ -1189,8 +1271,33 @@ function attach() {
       const result = baseOpenDecisionProject(...args);
       applyStoredTasks();
       bindCompletionSync();
+      showOriginCards();
       return result;
     };
+  }
+
+  /**
+   * 이 프로젝트를 만든 발견 카드를 실제로 보여 준다.
+   * 기존에는 개수만("2 이 프로젝트를 만든 발견 카드") 찍고, 어떤 카드였는지는
+   * dataset 에만 담아 둔 채 화면에 그리지 않았다.
+   */
+  function showOriginCards() {
+    document.querySelectorAll('.separate-project').forEach((project) => {
+      const preview = project.querySelector('.project-origin-preview');
+      if (!preview || preview.dataset.expandable) return;
+
+      let cards = [];
+      try { cards = JSON.parse(project.dataset.sourceCards || '[]'); } catch { cards = []; }
+      if (!cards.length) return;
+
+      preview.dataset.expandable = 'true';
+      preview.insertAdjacentHTML('afterend',
+        `<ul class="origin-card-list">${cards.map((card) => `<li>
+          <b>${card.title || ''}</b>
+          ${card.intro ? `<span>${card.intro}</span>` : ''}
+          ${card.reason ? `<small>${card.reason}</small>` : ''}
+        </li>`).join('')}</ul>`);
+    });
   }
 
   /** F-IYXFDA · 완료 체크를 DB 로 흘려보낸다. */

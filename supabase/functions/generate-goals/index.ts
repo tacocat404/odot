@@ -1,4 +1,5 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { cleanInput, cleanInputs, isSafeOutput } from "../_shared/safety.ts";
 
 // F-URTMLV · 분기 설문 + 좋아요한 키워드 → 카테고리별 목표 후보
 //
@@ -55,9 +56,11 @@ Deno.serve(async (req: Request) => {
     .slice(0, 5);
   if (!categories.length) return json({ error: "no_categories" }, 400);
 
-  const keywords = (payload.keywords ?? []).slice(0, 15);
+  const keywords = cleanInputs(payload.keywords, 30, 15);
+  // 설문 문항·답도 사용자 입력에서 파생되므로 함께 검사한다.
   const survey = (payload.survey ?? [])
-    .filter((item) => item?.q && item?.a)
+    .map((item) => ({ q: cleanInput(item?.q, 80), a: cleanInput(item?.a, 40) }))
+    .filter((item): item is { q: string; a: string } => Boolean(item.q && item.a))
     .slice(0, 8);
 
   const system = [
@@ -146,6 +149,7 @@ Deno.serve(async (req: Request) => {
       .map((item, i): [string, string, number] | null => {
         const title = String(item?.title ?? "").trim().slice(0, 40);
         if (!title) return null;
+        if (!isSafeOutput(title)) { console.warn("blocked_goal", title); return null; }
         const period = PERIODS.includes(String(item?.period))
           ? String(item.period)
           : PERIODS[Math.min(i, 2)];
