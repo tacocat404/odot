@@ -334,6 +334,35 @@ async function persistProject(project, duration) {
   });
 }
 
+/** 오늘의 한 줄을 DB 에 남긴다. 스트릭이 이 기록을 함께 센다. */
+async function persistTaskNote({ projectKey, index, note, date }) {
+  return safe('persistTaskNote', async () => {
+    const taskId = globalThis.Storage?.read?.()?.aiTaskIds?.[projectKey]?.[index];
+    if (!taskId || !note) return;
+    const { error } = await Cloud.client
+      .from('task_notes')
+      .upsert(
+        { task_id: taskId, user_id: Cloud.userId, note: String(note).slice(0, 300), noted_on: date },
+        { onConflict: 'task_id,noted_on' },
+      );
+    if (error) throw error;
+    logEvent('task_note', { projectKey, index });
+  });
+}
+
+/** 이번 주(월~일) 날짜를 YYYY-MM-DD 로 만든다. */
+function thisWeekDays() {
+  const today = new Date();
+  const monday = new Date(today);
+  // getDay(): 일=0. 월요일이 주의 시작이 되도록 옮긴다.
+  monday.setDate(today.getDate() - ((today.getDay() + 6) % 7));
+  return Array.from({ length: 7 }, (_, i) => {
+    const day = new Date(monday);
+    day.setDate(monday.getDate() + i);
+    return day.toLocaleDateString('sv-SE'); // YYYY-MM-DD, 로컬 기준
+  });
+}
+
 /** F-IYXFDA · 할 일 완료 여부를 DB 에 기록한다(캘린더 집계의 원천). */
 async function markTaskCompletion(projectKey, index, completed) {
   return safe('markTaskCompletion', async () => {
@@ -1432,23 +1461,105 @@ function attach() {
     };
   }
 
+  /**
+   * 잔디는 '완료한 날'뿐 아니라 '오늘의 한 줄을 남긴 날'도 이어진 날로 센다.
+   * 완료만 세면, 한 줄만 남긴 날이 잔디에서 빈칸으로 남는다.
+   */
   const baseGetStreakActivity = MockAPI.getStreakActivity?.bind(MockAPI);
   if (baseGetStreakActivity) {
     MockAPI.getStreakActivity = async () => {
       const rows = await safe('getStreakActivity', async () => {
-        const { data, error } = await Cloud.client
-          .from('daily_category_summary')
-          .select('day, category, completed_count')
-          .eq('user_id', Cloud.userId);
-        if (error) throw error;
-        if (!data?.length) return [];
-        return data.map((row) => ({
-          date: row.day,
-          category: row.category,
-          count: row.completed_count,
-        }));
+        const [done, notes] = await Promise.all([
+          Cloud.client.from('daily_category_summary')
+            .select('day, category, completed_count').eq('user_id', Cloud.userId),
+          Cloud.client.from('task_notes')
+            .select('noted_on, tasks(category)').eq('user_id', Cloud.userId),
+        ]);
+
+        const byDay = new Map();
+        const add = (date, category, n) => {
+          if (!date) return;
+          const row = byDay.get(date) || { date, category: category || '기타', count: 0 };
+          row.count += n;
+          if (category) row.category = category;
+          byDay.set(date, row);
+        };
+        (done.data || []).forEach((r) => add(r.day, r.category, r.completed_count));
+        (notes.data || []).forEach((r) => add(r.noted_on, r.tasks?.category, 1));
+
+        return [...byDay.values()].sort((a, b) => a.date.localeCompare(b.date));
       });
       return rows ?? baseGetStreakActivity();
+    };
+  }
+
+  // 오늘의 한 줄도 DB 에 남긴다. 스트릭이 이 기록을 함께 센다.
+  const baseSaveTaskNote = globalThis.saveTaskNote;
+  if (typeof baseSaveTaskNote === 'function') {
+    globalThis.saveTaskNote = (entry) => {
+      const result = baseSaveTaskNote(entry);
+      persistTaskNote({
+        projectKey: entry?.project,
+        index: entry?.task,
+        note: entry?.note,
+        date: entry?.date,
+      });
+      return result;
+    };
+  }
+
+  /**
+   * 주간 막대를 이번 주(월~일) 기준으로 다시 그린다.
+   *
+   * 원래 코드는 getDailyInterest() 결과의 마지막 7'행'을 잘랐다. 실제 기록은
+   * (날짜, 카테고리)별로 쪼개져 있어서, 하루에 세 분야를 골랐으면 그 하루가
+   * 세 행을 차지한다. 그래서 요일 하나만 막대로 남는 일이 생겼다.
+   */
+  async function renderWeeklyBars() {
+    const bars = document.querySelector('.weekly-bars');
+    if (!bars || !Cloud.online) return;
+
+    const days = thisWeekDays();
+    const daily = await MockAPI.getDailyInterest();
+    const labels = ['월', '화', '수', '목', '금', '토', '일'];
+
+    const week = days.map((date) => {
+      const rows = (daily || []).filter((item) => item.date === date);
+      const count = rows.reduce((sum, item) => sum + (item.count || 0), 0);
+      const top = rows.slice().sort((a, b) => b.count - a.count)[0];
+      return { date, count, category: top?.category || '기타' };
+    });
+
+    const max = Math.max(1, ...week.map((d) => d.count));
+    bars.innerHTML = week.map((day, i) => {
+      const visual = (Catalog?.categories || []).find((c) => c.name === day.category)
+        || (Catalog?.categories || []).at(-1);
+      const lead = day.count > 0 && day.count === max;
+      return `<div class="weekly-bar ${lead ? 'category-lead' : ''}"
+        style="--heat:var(--${visual.color})" title="${labels[i]}: ${day.count}장">
+        <b>${day.count}</b><i style="height:${(day.count / max) * 86}%"></i><span>${labels[i]}</span>
+      </div>`;
+    }).join('');
+
+    const card = bars.closest('.chart-card');
+    card?.querySelector('p')?.replaceChildren('이번 주 고른 카드 수');
+    const total = week.reduce((sum, d) => sum + d.count, 0);
+    const note = card?.querySelector('.chart-category-note');
+    if (note) {
+      const best = week.slice().sort((a, b) => b.count - a.count)[0];
+      note.textContent = total
+        ? `이번 주 ${total}장 · 가장 많이 고른 날은 ${labels[week.indexOf(best)]}요일이에요.`
+        : '이번 주에는 아직 고른 카드가 없어요.';
+    }
+  }
+
+  // 인사이트 화면이 그려진 뒤 주간 막대를 바로잡는다.
+  const baseRenderReviewForWeek = globalThis.renderReview;
+  if (typeof baseRenderReviewForWeek === 'function') {
+    globalThis.renderReview = async (...args) => {
+      const result = await baseRenderReviewForWeek(...args);
+      await renderWeeklyBars();
+      return result;
     };
   }
 
