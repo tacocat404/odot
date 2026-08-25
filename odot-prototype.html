@@ -1144,6 +1144,9 @@ calendarGridFitStyle.textContent=`
   #calendar .day.empty{padding:0!important}
 `;
 document.head.append(calendarGridFitStyle);
+/* Supabase 연동용 브릿지: 위 top-level const 는 window 에 자동으로 안 붙는다.
+   odot-supabase.js(모듈 스크립트)가 몽키패치할 수 있도록 명시적으로 노출한다. */
+Object.assign(window, {MockAPI, Storage, Catalog});
 </script>
 <!-- Supabase 연동: 실패해도 위 프로토타입은 그대로 동작한다 (odot-supabase.js 주석 참고) -->
 <script type="module" src="odot-supabase.js"></script>
