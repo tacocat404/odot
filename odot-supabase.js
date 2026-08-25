@@ -245,10 +245,47 @@ async function persistProject(project, duration) {
       suggested_when: typeof task === 'string' ? null : task.suggested_when || null,
       position,
     }));
-    if (tasks.length) await Cloud.client.from('tasks').insert(tasks);
+
+    if (tasks.length) {
+      const { data: inserted } = await Cloud.client
+        .from('tasks')
+        .insert(tasks)
+        .select('id, position');
+      // 화면의 체크박스(프로젝트 키 + 순번)를 DB 행에 이어 두어야 완료 표시를 저장할 수 있다.
+      if (inserted && project.projectKey) {
+        const ids = [];
+        inserted.forEach((t) => { ids[t.position] = t.id; });
+        const store = Storage.read();
+        store.aiTaskIds = store.aiTaskIds || {};
+        store.aiTaskIds[project.projectKey] = ids;
+        Storage.write(store);
+      }
+    }
 
     logEvent('project_created', { category: project.category, duration });
     return row.id;
+  });
+}
+
+/** F-IYXFDA · 할 일 완료 여부를 DB 에 기록한다(캘린더 집계의 원천). */
+async function markTaskCompletion(projectKey, index, completed) {
+  return safe('markTaskCompletion', async () => {
+    const taskId = globalThis.Storage?.read?.()?.aiTaskIds?.[projectKey]?.[index];
+    if (!taskId) return;
+
+    let query = Cloud.client
+      .from('tasks')
+      .update({ completed_at: completed ? new Date().toISOString() : null })
+      .eq('id', taskId)
+      .eq('user_id', Cloud.userId);
+
+    // 앱을 다시 열면 저장된 완료 상태를 되살리려고 체크박스를 프로그램이 다시 누른다.
+    // 그때 완료 시각을 덮어쓰면 캘린더 기록이 그날로 옮겨가므로, 이미 완료된 건 건드리지 않는다.
+    if (completed) query = query.is('completed_at', null);
+
+    const { error } = await query;
+    if (error) throw error;
+    if (completed) logEvent('task_completed', { projectKey, index });
   });
 }
 
@@ -543,11 +580,12 @@ function attach() {
         taskCount: 3, // 프로젝트 카드가 단계 3개로 그려진다
       });
       if (!ai?.tasks?.length) return null;
-      persistProject({
+      await persistProject({
         title: pick.goal?.[0] || ai.title,
         category: pick.category,
         keywords: ai.keywords?.length ? ai.keywords : keywords,
         tasks: ai.tasks,
+        projectKey: pick.key, // 완료 체크를 DB 행에 잇기 위한 키
       }, PERIOD_TO_DURATION[period] || '1주');
       return [pick.key, ai.tasks.map((t) => t.content)];
     }));
@@ -558,14 +596,32 @@ function attach() {
     Storage.write(data);
   }
 
-  // 프로젝트 카드가 그려질 때마다(신규 생성 · 앱 재시작 복원 모두) 할 일을 입힌다.
+  // 프로젝트 카드가 그려질 때마다(신규 생성 · 앱 재시작 복원 모두) 할 일을 입히고
+  // 완료 체크박스를 DB 에 연결한다.
   const baseOpenDecisionProject = globalThis.openDecisionProject;
   if (typeof baseOpenDecisionProject === 'function') {
     globalThis.openDecisionProject = (...args) => {
       const result = baseOpenDecisionProject(...args);
       applyStoredTasks();
+      bindCompletionSync();
       return result;
     };
+  }
+
+  /** F-IYXFDA · 완료 체크를 DB 로 흘려보낸다. */
+  function bindCompletionSync() {
+    document.querySelectorAll('.separate-project').forEach((project) => {
+      const key = project.dataset.projectKey;
+      project.querySelectorAll('.independent-task').forEach((task, index) => {
+        const check = task.querySelector('.task-check');
+        if (!check || check.dataset.cloudBound) return;
+        check.dataset.cloudBound = 'true';
+        // 프로토타입의 onclick 이 먼저 클래스를 토글한 뒤 이 리스너가 결과를 읽는다.
+        check.addEventListener('click', () => {
+          markTaskCompletion(key, index, task.classList.contains('completed'));
+        });
+      });
+    });
   }
 
   // 프로젝트 생성: AI 우선, 실패하면 기존 목업
@@ -604,8 +660,60 @@ function attach() {
     return project;
   };
 
+  // ── 인사이트 · 캘린더: 하드코딩 표 대신 실제 기록 ────────────────
+  // 두 화면 모두 고정 더미를 읽고 있었다. 사용자가 카드를 넘기거나 할 일을
+  // 끝내도 숫자가 그대로였다. 기록이 하나도 없을 때만 더미로 되돌아간다.
+
+  /** F-NYHVHG · 월간 관심 키워드 정산 */
+  const baseGetReview = MockAPI.getReview.bind(MockAPI);
+  MockAPI.getReview = async () => {
+    const ranks = await safe('getReview', async () => {
+      const start = new Date();
+      start.setDate(1);
+      start.setHours(0, 0, 0, 0);
+
+      const { data, error } = await Cloud.client
+        .from('card_reactions')
+        .select('category, created_at')
+        .eq('user_id', Cloud.userId)
+        .eq('reaction', 'like')
+        .gte('created_at', start.toISOString());
+      if (error) throw error;
+      if (!data?.length) return null;
+
+      const counts = new Map();
+      data.forEach((row) => counts.set(row.category, (counts.get(row.category) || 0) + 1));
+      return [...counts]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([category, count]) => ({ category, count, change: `+${count}` }));
+    });
+    return ranks || baseGetReview();
+  };
+
+  /** F-IYXFDA · 일별 완료 카테고리 */
+  const baseGetCompletions = MockAPI.getCompletions.bind(MockAPI);
+  MockAPI.getCompletions = async () => {
+    const rows = await safe('getCompletions', async () => {
+      const { data, error } = await Cloud.client
+        .from('daily_category_summary')
+        .select('day, category, completed_count')
+        .eq('user_id', Cloud.userId);
+      if (error) throw error;
+      if (!data?.length) return null;
+      // 화면은 완료 1건당 한 줄을 기대한다. 집계를 다시 펼친다.
+      return data.flatMap((row) =>
+        Array.from({ length: row.completed_count }, () => ({
+          date: row.day,
+          category: row.category,
+        })));
+    });
+    return rows || baseGetCompletions();
+  };
+
   // 앱 재시작 시 프로젝트 복원은 이 모듈보다 먼저 끝난다. 그 결과에도 할 일을 입힌다.
   applyStoredTasks();
+  bindCompletionSync();
 
   logEvent('session_start', { source: 'prototype' });
 }
