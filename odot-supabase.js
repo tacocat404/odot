@@ -113,6 +113,10 @@ function resetLocalState() {
   Cloud.keywordBySlug.clear();
   Cloud.survey = null;
   Cloud.surveySignature = null;
+  // 목표 표는 전역이라 비우지 않으면 앞 계정의 목표가 다음 계정에 남는다.
+  if (globalThis.decisionGoals) {
+    Object.keys(globalThis.decisionGoals).forEach((k) => { delete globalThis.decisionGoals[k]; });
+  }
   if (globalThis.state) {
     globalThis.state.interests = [];
     globalThis.state.deck = [];
@@ -1041,32 +1045,82 @@ function attach() {
 
   const PERIOD_TO_DURATION = { 단기: '1주', 중기: '1개월', 장기: '3개월' };
 
-  /** 목표 화면을 그리기 전에 decisionGoals 를 AI 결과로 덮어쓴다. */
+  /**
+   * 목표 화면.
+   *
+   * 프로토타입은 카테고리마다 고정 목표 3개를 들고 있다("이번 주 나를 소개하는 한 장
+   * 만들기" 같은 것). 예전에는 AI 결과를 그 표에 덮어쓰기만 해서, AI 가 어떤
+   * 카테고리를 빠뜨리거나 호출이 통째로 실패하면 고른 적 없는 고정 목표가 그대로
+   * 나왔다. 이제 표를 매번 비우고 AI 가 실제로 만들어 준 것만 채운다.
+   */
   const baseRenderDecisionGoals = globalThis.renderDecisionGoals;
   if (typeof baseRenderDecisionGoals === 'function') {
     globalThis.renderDecisionGoals = async () => {
       const state = globalThis.state;
       const decisionGoals = globalThis.decisionGoals;
-      const categories = [...new Set((state?.decisionLikes || []).map((c) => c.category))];
+      if (!decisionGoals) return baseRenderDecisionGoals();
 
-      if (Cloud.ai && decisionGoals && categories.length) {
-        const flow = document.querySelector('#decisionFlow');
-        if (flow) {
-          flow.innerHTML = `<div class="flow-card">${busyCardHTML('답변에 맞는 목표를 고르는 중')}</div>`;
-          startBusyCopyRotation(flow);
-        }
-        const goals = await generateGoalsViaAI({
+      clearGoalTable();
+
+      const liked = state?.decisionLikes || [];
+      const categories = [...new Set(liked.map((c) => c.category))];
+      if (!categories.length) {
+        showGoalTrouble('마음 가는 카드를 먼저 골라 주세요.', false);
+        return;
+      }
+
+      const flow = document.querySelector('#decisionFlow');
+      if (flow) {
+        flow.innerHTML = `<div class="flow-card">${busyCardHTML('답변에 맞는 목표를 고르는 중')}</div>`;
+        startBusyCopyRotation(flow);
+      }
+
+      const goals = Cloud.ai
+        ? await generateGoalsViaAI({
           categories,
           keywords: Cloud.likedKeywords(),
           survey: surveyAnswers(),
-        });
-        // 받은 카테고리만 갈아끼운다. 실패하면 기존 고정 목표가 그대로 남는다.
-        if (goals) Object.assign(decisionGoals, goals);
-      }
+        })
+        : null;
 
-      baseRenderDecisionGoals();
+      const covered = new Set(
+        Object.keys(goals || {}).filter((c) => Array.isArray(goals[c]) && goals[c].length),
+      );
+      if (!covered.size) {
+        showGoalTrouble('목표를 만들지 못했어요.', true);
+        return;
+      }
+      Object.assign(decisionGoals, goals);
+
+      // 목표가 만들어진 카테고리만 그린다. 빠진 카테고리를 그대로 넘기면
+      // 프로토타입이 decisionGoals.기타 로 되돌아가 엉뚱한 목표를 보여 준다.
+      const all = state.decisionLikes;
+      state.decisionLikes = all.filter((c) => covered.has(c.category));
+      try {
+        baseRenderDecisionGoals();
+      } finally {
+        state.decisionLikes = all;
+      }
       wireConfirmButton();
     };
+  }
+
+  /** 고정 목표가 절대 화면에 닿지 않도록 표를 비운다. */
+  function clearGoalTable() {
+    const table = globalThis.decisionGoals;
+    if (!table) return;
+    Object.keys(table).forEach((key) => { delete table[key]; });
+  }
+
+  function showGoalTrouble(message, retry) {
+    const flow = document.querySelector('#decisionFlow');
+    if (!flow) return;
+    flow.innerHTML = `<div class="flow-card"><p class="flow-kicker">목표 만들기</p>`
+      + `<h2>${message}</h2>`
+      + `<p class="sub">${retry ? '잠시 뒤 다시 시도해 주세요.' : '카드를 고르면 목표를 만들어 드릴게요.'}</p></div>`
+      + (retry ? '<button class="flow-primary" id="goalRetry" type="button">다시 시도</button>' : '');
+    const again = flow.querySelector('#goalRetry');
+    if (again) again.onclick = () => globalThis.renderDecisionGoals();
   }
 
   /** 목표 확정 버튼: 프로젝트가 그려지기 전에 할 일을 미리 만들어 둔다. */
