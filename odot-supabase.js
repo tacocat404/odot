@@ -36,6 +36,19 @@ const Cloud = {
   interests() {
     return globalThis.Storage?.read?.()?.interests || [];
   },
+  /**
+   * 끝낸 프로젝트 제목 (추천의 "나의 궤적" 소스).
+   * 아카이브에 보관된 완료 프로젝트와, 할 일을 모두 끝낸 진행 프로젝트를 함께 본다.
+   */
+  doneProjects() {
+    const data = globalThis.Storage?.read?.() || {};
+    const archived = (data.completedProjects || []).map((p) => p.title);
+    const finished = (data.activeProjects || [])
+      .filter((p) => (p.done || []).length && (p.done || []).length >= (data.aiTasks?.[p.key] || []).length)
+      .map((p) => p.goal?.[0])
+      .filter(Boolean);
+    return [...new Set([...archived, ...finished])].slice(0, 10);
+  },
   /** 좋아요한 카드의 키워드 목록 (to-do 생성의 재료) */
   likedKeywords() {
     const reactions = globalThis.Storage?.read?.()?.reactions || [];
@@ -391,10 +404,7 @@ function surveyAnswers() {
 
 /**
  * AI 가 만든 할 일을 프로젝트 카드 DOM 에 적용한다.
- *
- * planStages() 는 할 일 뒤에 기간별 마무리 점검 단계를 하나 더 붙인다.
- * 그래서 카드의 단계 수는 항상 (할 일 수 + 1) 이다. 앞쪽 할 일만 교체하고
- * 마지막 마무리 단계는 프로토타입이 만든 문구 그대로 남긴다.
+ * 마무리 단계까지 AI 가 만들므로 단계 수와 할 일 수가 1:1 로 맞는다.
  */
 function applyStoredTasks() {
   const saved = globalThis.Storage?.read?.()?.aiTasks || {};
@@ -422,6 +432,7 @@ async function fetchKeywordCards(count) {
     interests: Cloud.interests(),
     likedKeywords: Cloud.likedKeywords(),
     seenKeywords: [...Cloud.keywordBySlug.values()].slice(-40),
+    doneProjects: Cloud.doneProjects(),
     count,
   });
   if (!data?.cards?.length) return [];
@@ -731,7 +742,7 @@ function attach() {
         interests,
         likedTitles: keywords,
         goal: pick.goal?.[0],
-        taskCount: 3, // 프로젝트 카드가 단계 3개로 그려진다
+        taskCount: 4, // planStages 의 날짜 슬롯이 4개다(마무리 단계 포함)
       });
       if (!ai?.tasks?.length) return null;
       await persistProject({

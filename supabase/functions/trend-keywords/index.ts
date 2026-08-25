@@ -69,6 +69,7 @@ Deno.serve(async (req: Request) => {
     interests?: string[];
     likedKeywords?: string[];
     seenKeywords?: string[];
+    doneProjects?: string[];
     count?: number;
   };
   try {
@@ -80,9 +81,30 @@ Deno.serve(async (req: Request) => {
   const interests = (payload.interests ?? []).slice(0, 5);
   const liked = (payload.likedKeywords ?? []).slice(0, 15);
   const seen = (payload.seenKeywords ?? []).slice(0, 40);
+  const doneProjects = (payload.doneProjects ?? []).slice(0, 10);
   const count = Math.min(Math.max(payload.count ?? 5, 1), 8);
 
   const trends = await fetchTrends();
+
+  /**
+   * 소스를 명시적으로 배분한다. 트렌드는 넷 중 하나일 뿐이다.
+   * 카드 수가 5장보다 적으면 앞쪽 소스부터 채운다.
+   */
+  const plan: string[] = [];
+  const hasHistory = doneProjects.length > 0;
+  const hasLiked = liked.length > 0;
+
+  if (hasHistory) plan.push("나의 궤적", "나의 궤적");
+  if (hasLiked) plan.push("취향 심화");
+  if (trends.length) plan.push("실시간 트렌드");
+  plan.push("넓히기");
+  // 남는 자리는 취향 심화 → 넓히기 순으로 메운다.
+  while (plan.length < count) plan.push(hasLiked ? "취향 심화" : "넓히기");
+  plan.length = count;
+
+  const planLines = plan
+    .map((source, i) => `${i + 1}번 카드 — ${source}`)
+    .join("\n");
 
   const system = [
     "너는 ODOT의 키워드 카드 추천기다.",
@@ -98,24 +120,26 @@ Deno.serve(async (req: Request) => {
     `- category 는 반드시 다음 중 하나다: ${CATEGORIES.join(", ")}`,
     "- intro 는 그 키워드가 무엇인지 한 문장(30자 이내)으로 설명한다.",
     "- easy 는 초등학생도 이해할 수 있는 1~2문장 설명이다.",
-    "- reason 은 추천 근거를 짧게 쓴다. 트렌드에서 왔으면 '실시간 트렌드 · <원본 검색어>' 형식으로 쓴다.",
     "- 미성년자가 쓴다. 위험한 활동, 의료·투자 조언, 음주·흡연, 성인 주제, 무리한 다이어트, 특정 인물 비방은 절대 넣지 않는다.",
     "- 실존 인물 이름 자체를 keyword 로 쓰지 않는다. 그 인물과 연결되는 '배울 수 있는 분야'로 바꾼다. 예: 축구 선수 → 축구 전술.",
+    "",
+    "카드마다 정해진 소스가 있다. 소스를 지켜서 만들고 reason 에 그 소스를 밝힌다:",
+    "- 나의 궤적 → 사용자가 이미 끝낸 프로젝트에서 자연스럽게 이어질 다음 주제. reason: '끝낸 프로젝트에서 이어져 · <프로젝트 제목>'",
+    "- 취향 심화 → 좋아요한 키워드보다 한 단계 깊거나 구체적인 키워드. reason: '좋아한 <키워드>에서 한 걸음 더'",
+    "- 실시간 트렌드 → 지금 검색되는 말에서 배울 거리로 옮긴 것. reason: '실시간 트렌드 · <원본 검색어>'",
+    "- 넓히기 → 아직 반응이 없던 분야에서 하나. reason: '아직 안 본 분야 · <분야>'",
   ].join("\n");
 
   const user = [
-    trends.length
-      ? `지금 한국에서 실시간으로 많이 검색되는 말: ${trends.join(", ")}`
-      : "실시간 트렌드를 가져오지 못했다. 관심 분야만 참고한다.",
+    doneProjects.length ? `사용자가 끝낸 프로젝트: ${doneProjects.join(" / ")}` : "",
     interests.length ? `사용자가 고른 관심 분야: ${interests.join(", ")}` : "",
     liked.length ? `사용자가 좋아요한 키워드: ${liked.join(", ")}` : "",
+    trends.length ? `지금 한국에서 실시간으로 많이 검색되는 말: ${trends.join(", ")}` : "",
     seen.length ? `이미 보여 준 키워드(중복 금지): ${seen.join(", ")}` : "",
     "",
-    `서로 다른 키워드 카드 ${count}개를 만든다.`,
-    trends.length
-      ? "가능하면 절반 이상은 위 실시간 검색어에서 출발해, 학생이 배울 수 있는 분야 키워드로 바꿔 만든다."
-      : "",
-    interests.length ? "나머지는 사용자의 관심 분야에서 고른다." : "",
+    `서로 다른 키워드 카드 ${count}개를 만든다. 각 카드의 소스는 다음과 같이 정해져 있다:`,
+    planLines,
+    "",
     "다음 JSON 형태로만 답한다:",
     '{"cards":[{"keyword":"한국사","category":"공부","intro":"우리나라의 지난 이야기를 다루는 과목.","reason":"실시간 트렌드 · 광복절","easy":"옛날에 우리나라에서 있었던 일을 배우는 거예요."}]}',
   ]
