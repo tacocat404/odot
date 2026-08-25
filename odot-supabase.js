@@ -32,6 +32,9 @@ const Cloud = {
   cardIds: new Map(),        // slug -> keyword_cards.id
   keywordBySlug: new Map(),  // slug -> 키워드 문자열
   inFlight: 0,               // 진행 중인 카드 생성 요청 수
+  survey: null,              // 미리 만들어 둔 설문 문항
+  surveySignature: null,     // 그 설문을 만든 좋아요 키워드 조합
+  surveyPending: false,
 
   interests() {
     return globalThis.Storage?.read?.()?.interests || [];
@@ -329,6 +332,42 @@ async function generateProjectViaAI({ category, duration, interests, likedTitles
   return data;
 }
 
+/**
+ * F-URTMLV · 좋아요한 키워드로 설문 문항 생성
+ * 카드를 넘기는 동안 미리 만들어 두어, 설문 진입에서 기다리지 않게 한다.
+ */
+async function prepareSurvey() {
+  if (!Cloud.ai || Cloud.surveyPending) return;
+  const keywords = Cloud.likedKeywords();
+  if (!keywords.length) return;
+  // 좋아요한 키워드가 그대로면 이미 만든 설문을 다시 쓴다.
+  const signature = keywords.join('|');
+  if (Cloud.surveySignature === signature) return;
+
+  Cloud.surveyPending = true;
+  try {
+    const categories = [...new Set((globalThis.state?.decisionLikes || []).map((c) => c.category))];
+    const data = await invoke('generate-survey', { keywords, categories });
+    if (data?.questions?.length) {
+      Cloud.survey = data.questions;
+      Cloud.surveySignature = signature;
+    }
+  } finally {
+    Cloud.surveyPending = false;
+  }
+}
+
+/** 생성된 설문을 프로토타입의 decisionQuestions 배열 형태로 바꿔 끼운다. */
+function applySurvey() {
+  const target = globalThis.decisionQuestions;
+  if (!Array.isArray(target) || !Cloud.survey?.length) return false;
+  // 프로토타입은 각 항목이 [질문, 보기배열] 을 돌려주는 함수라고 가정한다.
+  const built = Cloud.survey.map((item) => () => [item.q, item.options]);
+  target.length = 0;
+  target.push(...built);
+  return true;
+}
+
 /** F-URTMLV · 설문 답변 + 좋아요한 키워드 → 카테고리별 목표 후보 */
 async function generateGoalsViaAI({ categories, keywords, survey }) {
   const data = await invoke('generate-goals', { categories, keywords, survey });
@@ -412,8 +451,10 @@ function applyStoredTasks() {
     const tasks = saved[project.dataset.projectKey];
     if (!Array.isArray(tasks) || !tasks.length) return;
     const rows = [...project.querySelectorAll('.independent-task')];
-    if (rows.length < tasks.length) return; // 예상보다 단계가 적으면 건드리지 않는다
-    tasks.forEach((task, i) => {
+    if (!rows.length) return;
+    // 개수가 어긋나도 겹치는 만큼은 바꾼다. 예전에는 통째로 건너뛰어
+    // 하드코딩 문구가 그대로 노출됐다.
+    tasks.slice(0, rows.length).forEach((task, i) => {
       const label = rows[i]?.querySelector('.independent-task-copy strong');
       if (label) label.textContent = task;
       rows[i]?.querySelector('.task-check')?.setAttribute('aria-label', `${task} 완료 표시`);
@@ -566,7 +607,30 @@ function attach() {
     globalThis.react = async (type) => {
       await baseReact(type);
       prefetchAhead();
+      // 좋아요가 쌓일 때마다 설문을 미리 만들어 둔다(응답을 기다리지 않는다).
+      if (type === 'like') prepareSurvey();
     };
+  }
+
+  // 설문 시작 시점에 준비된 문항으로 갈아끼운다. 없으면 기존 고정 문항을 쓴다.
+  const baseStartDecision = globalThis.startDecision;
+  if (typeof baseStartDecision === 'function') {
+    globalThis.startDecision = async () => {
+      if (Cloud.ai && !Cloud.survey && (globalThis.state?.decisionLikes || []).length) {
+        const flow = document.querySelector('#decisionFlow');
+        if (flow) {
+          globalThis.setDecisionMode?.(true);
+          flow.innerHTML = `<div class="flow-card">${busyCardHTML('고른 키워드로 질문을 만드는 중')}</div>`;
+          startBusyCopyRotation(flow);
+        }
+        await prepareSurvey();
+      }
+      applySurvey();
+      baseStartDecision();
+    };
+    // 버튼은 원본 함수를 '값'으로 붙잡고 있어서 위 교체가 반영되지 않는다. 다시 연결한다.
+    const startBtn = document.querySelector('#decisionStart');
+    if (startBtn) startBtn.onclick = () => globalThis.startDecision();
   }
 
   /**
@@ -632,10 +696,43 @@ function attach() {
     likedCount.insertAdjacentElement('afterend', hint);
   }
 
-  // 키보드만으로도 카드에 반응할 수 있게 한다(하단 버튼 제거 대비).
+  /* ── C-2 · 조작을 스와이프로 통일 ─────────────────────────────
+     하단 하트·X·정보 버튼과 질문 찾기 버튼은 스와이프와 같은 일을 중복으로 하고
+     있었다. 버튼을 걷어내고 비어 있던 아래 방향을 질문 찾기에 연결한다.
+     (제스처 안내는 소개 화면에서 따로 다룬다.) */
+  document.querySelector('.reaction-row')?.remove();
+  // #decisionStart 는 지우지 않는다. renderDeck 과 setDecisionMode 가 이 노드의
+  // .hidden 을 직접 만지므로, 제거하면 두 함수가 null 참조로 죽는다. 감추기만 한다.
+  const startStyle = document.createElement('style');
+  startStyle.textContent = '#decisionStart{display:none!important}';
+  document.head.append(startStyle);
+
+  const deckCard = document.querySelector('#activeCard');
+  if (deckCard) {
+    let down = null;
+    deckCard.addEventListener('pointerdown', (e) => { down = { x: e.clientX, y: e.clientY }; });
+    deckCard.addEventListener('pointerup', (e) => {
+      if (!down) return;
+      const dx = e.clientX - down.x;
+      const dy = e.clientY - down.y;
+      down = null;
+      // 좌우/위는 프로토타입의 기존 핸들러가 처리한다. 아래만 여기서 맡는다.
+      if (dy > 100 && Math.abs(dx) < 80) {
+        deckCard.style.transform = '';
+        if (!(globalThis.state?.decisionLikes || []).length) {
+          globalThis.toast?.('마음 가는 카드를 한 장 이상 골라주세요.');
+          return;
+        }
+        globalThis.startDecision?.();
+      }
+    });
+  }
+
+  // 키보드만으로도 카드에 반응할 수 있게 한다(버튼을 없앤 대신).
   document.addEventListener('keydown', (event) => {
     if (document.querySelector('#explore')?.classList.contains('active') !== true) return;
-    if (event.target.closest('input, textarea, button')) return;
+    // 이벤트 타깃이 document 일 수 있으므로 closest 를 안전하게 호출한다.
+    if (event.target?.closest?.('input, textarea, button')) return;
     const map = { ArrowLeft: 'pass', ArrowRight: 'like' };
     if (map[event.key]) { event.preventDefault(); globalThis.react?.(map[event.key]); }
     else if (event.key === 'ArrowUp') { event.preventDefault(); globalThis.openSheet?.('#summarySheet'); }
@@ -687,9 +784,8 @@ function attach() {
       if (Cloud.ai && decisionGoals && categories.length) {
         const flow = document.querySelector('#decisionFlow');
         if (flow) {
-          flow.innerHTML = '<div class="flow-card"><p class="flow-kicker">답변을 읽는 중</p>'
-            + '<h2>고른 키워드에 맞는<br>목표를 만들고 있어요.</h2>'
-            + '<p class="sub">잠시만 기다려 주세요.</p></div>';
+          flow.innerHTML = `<div class="flow-card">${busyCardHTML('답변에 맞는 목표를 고르는 중')}</div>`;
+          startBusyCopyRotation(flow);
         }
         const goals = await generateGoalsViaAI({
           categories,
@@ -718,7 +814,7 @@ function attach() {
 
       const label = confirm.textContent;
       confirm.disabled = true;
-      confirm.textContent = '할 일을 만드는 중…';
+      confirm.textContent = '밍밍이가 할 일을 만드는 중…';
       try {
         await buildTasksFor(picks);
       } finally {
@@ -742,7 +838,9 @@ function attach() {
         interests,
         likedTitles: keywords,
         goal: pick.goal?.[0],
-        taskCount: 4, // planStages 의 날짜 슬롯이 4개다(마무리 단계 포함)
+        // 카드의 단계 수는 Catalog.projects 의 항목 수(3)를 따른다. 개수가 어긋나면
+        // applyStoredTasks 가 적용을 건너뛰어 하드코딩 문구가 그대로 남는다.
+        taskCount: 3,
       });
       if (!ai?.tasks?.length) return null;
       await persistProject({
