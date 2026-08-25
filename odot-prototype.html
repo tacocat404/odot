@@ -1005,4 +1005,142 @@ goalFitScaleStyle.textContent=`
   }
 `;
 document.head.append(goalFitScaleStyle);
+
+/* Running projects used to live only in memory: a refresh wiped them, and every
+   new discovery flow replaced the previous set instead of adding to it. */
+function localDay(date){const d=date?new Date(date):new Date();d.setHours(12,0,0,0);return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;}
+function shiftDay(stamp,days){const d=new Date(`${stamp}T12:00:00`);d.setDate(d.getDate()+days);return d;}
+function dayGap(fromStamp,toStamp){return Math.round((new Date(`${toStamp}T12:00:00`)-new Date(`${fromStamp}T12:00:00`))/86400000);}
+todayKey=()=>localDay();
+countConnectionStreak=project=>{const dates=new Set(readCheckins().filter(item=>item.project===project).map(item=>item.date));let count=0,cursor=new Date();while(dates.has(localDay(cursor))){count++;cursor.setDate(cursor.getDate()-1)}return count;};
+
+const activePlanOffsets={단기:[0,2,5,7],중기:[0,7,18,28],장기:[0,14,49,84]};
+function readActiveProjects(){return Storage.read().activeProjects||[];}
+function writeActiveProjects(list){const data=Storage.read();data.activeProjects=list;Storage.write(data);}
+function patchActiveProject(key,patch){writeActiveProjects(readActiveProjects().map(item=>item.key===key?{...item,...patch}:item));}
+function syncProjectSignal(){const signal=$('#projectSignal'),count=readActiveProjects().length;if(signal)signal.textContent=count?`진행 중 ${count}개`:'내 프로젝트';}
+
+/* Dates are re-derived from the stored start day so D-day actually counts down. */
+function restateProjectDates(project,record){
+  const period=record.goal[1],span=planDays[period]||28,offsets=activePlanOffsets[period]||activePlanOffsets.중기;
+  const start=record.startedAt||todayKey(),today=todayKey(),end=shiftDay(start,span),left=dayGap(today,localDay(end));
+  const head=project.querySelector('.project-meta-row .project-meta');
+  if(head)head.innerHTML=`<strong>${left>0?`D-${left}`:left===0?'D-DAY':'마감 지남'}</strong> · ${formatDeadline(end)} 마감`;
+  project.querySelectorAll('.independent-task').forEach((task,index)=>{
+    const at=shiftDay(start,offsets[index]??span),gap=dayGap(today,localDay(at));
+    const label=task.querySelector('.independent-task-copy small'),due=task.querySelector('.task-date');
+    if(label)label.textContent=`${formatDeadline(at)} · ${index===0?'첫 행동':'다음 단계'}`;
+    if(due)due.textContent=gap>0?`D-${gap}`:gap===0?'오늘':'지남';
+  });
+}
+
+function restoreProjectCard(project,record){
+  const notes=(Storage.read().taskNotes||[]).filter(item=>item.project===record.key);
+  const latestNote=task=>notes.filter(item=>String(item.task)===String(task)).sort((a,b)=>a.date<b.date?1:-1)[0];
+  const done=new Set(record.done||[]);
+  const lockRow=(row,note)=>{const input=row.querySelector('input'),save=row.querySelector('button');input.value=note;input.disabled=true;save.textContent='완료';save.disabled=true;};
+  const nativeFocus=HTMLElement.prototype.focus;
+  HTMLElement.prototype.focus=function(){};
+  try{
+    project.querySelectorAll('.independent-task').forEach((task,index)=>{
+      if(done.has(index)&&!task.classList.contains('completed'))task.querySelector('.task-check').click();
+      const saved=latestNote(index);
+      if(!saved)return;
+      lockRow(task.querySelector('.task-note-row'),saved.note);
+      task.classList.add('note-saved');
+    });
+  }finally{HTMLElement.prototype.focus=nativeFocus;}
+  const daily=latestNote('project-note'),row=project.querySelector('.project-note-row');
+  if(daily&&row&&daily.date===todayKey()){lockRow(row,daily.note);row.classList.add('saved');}
+}
+
+function bindProjectPersistence(project,record){
+  project.querySelectorAll('.independent-task').forEach((task,index)=>{
+    task.querySelector('.task-check').addEventListener('click',()=>{
+      const current=readActiveProjects().find(item=>item.key===record.key);
+      if(!current)return;
+      const done=new Set(current.done||[]);
+      task.classList.contains('completed')?done.add(index):done.delete(index);
+      patchActiveProject(record.key,{done:[...done].sort((a,b)=>a-b)});
+    });
+  });
+}
+
+const persistedProjectOpen=openDecisionProject;
+openDecisionProject=()=>{
+  const fresh=(state.decisionGoalsSelected||[]).map(item=>({...item}));
+  const hydrating=!fresh.length;
+  const stored=readActiveProjects(),knownKeys=new Set(stored.map(item=>item.key));
+  const merged=[...stored,...fresh.filter(pick=>!knownKeys.has(pick.key)).map(pick=>({key:pick.key,category:pick.category,goal:pick.goal,startedAt:todayKey(),sources:[],done:[]}))];
+  if(!merged.length)return;
+  const freshCategories=new Set(fresh.map(pick=>pick.category));
+  const cardsBefore=interestCards(),reusableBefore=readReusableCards();
+  writeActiveProjects(merged);
+  state.decisionGoalsSelected=merged.map(item=>({key:item.key,category:item.category,goal:item.goal}));
+  persistedProjectOpen();
+  if(hydrating){
+    /* Re-rendering stored projects must not spend the cards waiting in the inbox. */
+    writeCardStore(cardsBefore);writeReusableCards(reusableBefore);syncProjectCandidates();
+  }else{
+    /* Only the categories the user just picked may consume candidate cards. */
+    const survivors=new Set(interestCards().map(card=>card.id));
+    const rescued=cardsBefore.filter(card=>!survivors.has(card.id)&&!freshCategories.has(card.category)).map(card=>({...card,candidate:false}));
+    if(rescued.length){writeCardStore([...interestCards(),...rescued]);syncProjectCandidates();}
+  }
+  updateProjectCardCount();renderReusableShelf();
+  const records=readActiveProjects();
+  $$('.separate-project').forEach(project=>{
+    const record=records.find(item=>item.key===project.dataset.projectKey);
+    if(!record)return;
+    if(knownKeys.has(record.key)){
+      project.dataset.sourceCards=JSON.stringify(record.sources||[]);
+    }else{
+      let sources=[];
+      try{sources=JSON.parse(project.dataset.sourceCards||'[]')}catch{sources=[]}
+      record.sources=sources;patchActiveProject(record.key,{sources});
+    }
+    const counter=project.querySelector('.project-origin-preview b');
+    if(counter)counter.textContent=String((record.sources||[]).length);
+    restateProjectDates(project,record);
+    restoreProjectCard(project,record);
+    bindProjectPersistence(project,record);
+  });
+  syncProjectSignal();
+};
+
+const persistedArchiveProject=archiveProjectFromCard;
+archiveProjectFromCard=project=>{
+  const key=project.dataset.projectKey;
+  persistedArchiveProject(project);
+  writeActiveProjects(readActiveProjects().filter(item=>item.key!==key));
+  syncProjectSignal();
+};
+
+/* Restore whatever was running when the app was last closed, without stealing the screen. */
+(()=>{
+  if(!readActiveProjects().length)return;
+  const current=$('.screen.active')?.id;
+  const realShowScreen=showScreen,realToast=toast;
+  showScreen=()=>{};toast=()=>{};
+  try{state.decisionGoalsSelected=[];openDecisionProject();}
+  catch(error){console.warn('진행 중 프로젝트를 복원하지 못했어요.',error);}
+  finally{showScreen=realShowScreen;toast=realToast;}
+  if(current)realShowScreen(current);
+})();
+
+/* Square day cells set a min-content wider than a 1fr track, so the month grid
+   grew past the viewport: the whole Saturday column fell off-screen and the
+   weekday header no longer lined up with the dates below it. */
+const calendarGridFitStyle=document.createElement('style');
+calendarGridFitStyle.textContent=`
+  .weekday,
+  #calendar .weekday,
+  .month-grid,
+  #calendar .month-grid{grid-template-columns:repeat(7,minmax(0,1fr))!important}
+  .day,
+  #calendar .day{min-width:0}
+  .day.empty,
+  #calendar .day.empty{padding:0!important}
+`;
+document.head.append(calendarGridFitStyle);
 </script></body></html>
