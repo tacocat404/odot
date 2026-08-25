@@ -82,6 +82,18 @@ async function ensureCard(topic) {
   if (!slug) return null;
   if (Cloud.cardIds.has(slug)) return Cloud.cardIds.get(slug);
 
+  // 이전 세션에서 이미 만들어 둔 카드일 수 있다. 중복 행을 만들지 않는다.
+  const { data: existing } = await Cloud.client
+    .from('keyword_cards')
+    .select('id')
+    .eq('user_id', Cloud.userId)
+    .eq('slug', slug)
+    .maybeSingle();
+  if (existing) {
+    Cloud.cardIds.set(slug, existing.id);
+    return existing.id;
+  }
+
   const { data, error } = await Cloud.client
     .from('keyword_cards')
     .insert({
@@ -154,17 +166,14 @@ async function saveReaction(topic, type) {
     const cardId = await ensureCard(topic);
     if (!cardId) return;
     const reaction = type === 'like' ? 'like' : type === 'pass' ? 'pass' : 'detail';
-    const { error } = await Cloud.client
-      .from('card_reactions')
-      .upsert(
-        {
-          user_id: Cloud.userId,
-          card_id: cardId,
-          category: knownCategory(topic.category),
-          reaction,
-        },
-        { onConflict: 'user_id,card_id', ignoreDuplicates: true },
-      );
+    // like/pass 는 카드당 1회만 확정된다(부분 unique 인덱스).
+    // 부분 인덱스는 PostgREST 의 onConflict 로 지정할 수 없으므로 중복 오류를 그대로 흘려보낸다.
+    const { error } = await Cloud.client.from('card_reactions').insert({
+      user_id: Cloud.userId,
+      card_id: cardId,
+      category: knownCategory(topic.category),
+      reaction,
+    });
     if (error && error.code !== '23505') throw error;
     logEvent('card_reaction', { category: topic.category, reaction });
   });
