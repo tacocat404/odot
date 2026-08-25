@@ -105,7 +105,8 @@ renderCalendar=async()=>{
     const visual=category(winnerName);
     const sticker=document.createElement('img');
     sticker.className='calendar-sticker';
-    sticker.src=`assets/calendar-stickers/${visual.asset.split('category-')[1]}`;
+    // The exercise sticker must stay in the same hand-drawn character style as the app.
+    sticker.src=winnerName==='운동'?visual.asset:`assets/calendar-stickers/${visual.asset.split('category-')[1]}`;
     sticker.alt='';
     sticker.setAttribute('aria-hidden','true');
     day.append(sticker);
