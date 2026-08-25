@@ -773,17 +773,13 @@ unifiedCardStoreStyle.textContent=`
 `;
 document.head.append(unifiedCardStoreStyle);
 var CARD_STORE_VERSION='interest-inbox-v1';
-var demoInterestCards=[
-  {id:'demo-career-portfolio',category:'진로',title:'나를 소개하는 포트폴리오 한 장',intro:'나의 경험을 한 장으로 정리해 봐요.',reason:'진로 · 다음 프로젝트 후보',candidate:true},
-  {id:'demo-reading-reflection',category:'독서',title:'마음에 남은 문장 한 줄 기록하기',intro:'읽고 난 뒤 나만의 문장을 남겨봐요.',reason:'독서 · 다음 프로젝트 후보',candidate:true}
-];
+/* 관심 카드함은 비어서 시작한다. 발견 탭에서 실제로 좋아요한 카드만 쌓인다.
+   (이전에는 데모 카드 2장을 미리 넣어 두어, 사용자가 고르지 않은 목표가 후보에 섞였다.) */
+var demoInterestCards=[];
 function normalizeInterestCard(card){return{...cardSnapshot(card),candidate:Boolean(card.candidate)};}
 function readCardStore(){
   const data=Storage.read();
-  const seed=demoInterestCards||[
-    {id:'demo-career-portfolio',category:'진로',title:'나를 소개하는 포트폴리오 한 장',intro:'나의 경험을 한 장으로 정리해 봐요.',reason:'진로 · 다음 프로젝트 후보',candidate:true},
-    {id:'demo-reading-reflection',category:'독서',title:'마음에 남은 문장 한 줄 기록하기',intro:'읽고 난 뒤 나만의 문장을 남겨봐요.',reason:'독서 · 다음 프로젝트 후보',candidate:true}
-  ];
+  const seed=demoInterestCards||[];
   if(!data.cardStore||data.cardStore.version!==CARD_STORE_VERSION){
     data.cardStore={version:CARD_STORE_VERSION,cards:seed.map(normalizeInterestCard)};
     Storage.write(data);
@@ -1147,7 +1143,7 @@ document.head.append(calendarGridFitStyle);
 /* Supabase 연동용 브릿지: 위 top-level const/let 은 window 에 자동으로 안 붙는다.
    (function 선언인 renderDeck/cardHTML/react/activeTopic 은 이미 window 에 있다.)
    odot-supabase.js(모듈 스크립트)가 몽키패치할 수 있도록 명시적으로 노출한다. */
-Object.assign(window, {MockAPI, Storage, Catalog, state});
+Object.assign(window, {MockAPI, Storage, Catalog, state, decisionGoals, decisionQuestions});
 </script>
 <!-- Supabase 연동: 실패해도 위 프로토타입은 그대로 동작한다 (odot-supabase.js 주석 참고) -->
 <script type="module" src="odot-supabase.js"></script>

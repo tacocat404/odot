@@ -270,10 +270,54 @@ async function invoke(fn, body) {
 }
 
 /** F-PEBLKV · AI 프로젝트 생성 */
-async function generateProjectViaAI({ category, duration, interests, likedTitles }) {
-  const data = await invoke('generate-project', { category, duration, interests, likedTitles });
+async function generateProjectViaAI({ category, duration, interests, likedTitles, goal, taskCount }) {
+  const data = await invoke('generate-project', {
+    category, duration, interests, likedTitles, goal, taskCount,
+  });
   if (!data?.tasks?.length) return null;
   return data;
+}
+
+/** F-URTMLV · 설문 답변 + 좋아요한 키워드 → 카테고리별 목표 후보 */
+async function generateGoalsViaAI({ categories, keywords, survey }) {
+  const data = await invoke('generate-goals', { categories, keywords, survey });
+  return data?.goals || null;
+}
+
+/** 설문 문항과 고른 답을 사람이 읽는 문장으로 되돌린다. */
+function surveyAnswers() {
+  const questions = globalThis.decisionQuestions || [];
+  const answers = globalThis.state?.decisionAnswers || [];
+  const lead = globalThis.state?.decisionLikes?.[0];
+  return questions
+    .map((build, i) => {
+      if (answers[i] == null) return null;
+      const [q, options] = build(lead);
+      return { q, a: options[answers[i]] };
+    })
+    .filter(Boolean);
+}
+
+/**
+ * AI 가 만든 할 일을 프로젝트 카드 DOM 에 적용한다.
+ *
+ * planStages() 는 할 일 뒤에 기간별 마무리 점검 단계를 하나 더 붙인다.
+ * 그래서 카드의 단계 수는 항상 (할 일 수 + 1) 이다. 앞쪽 할 일만 교체하고
+ * 마지막 마무리 단계는 프로토타입이 만든 문구 그대로 남긴다.
+ */
+function applyStoredTasks() {
+  const saved = globalThis.Storage?.read?.()?.aiTasks || {};
+  document.querySelectorAll('.separate-project').forEach((project) => {
+    const tasks = saved[project.dataset.projectKey];
+    if (!Array.isArray(tasks) || !tasks.length) return;
+    const rows = [...project.querySelectorAll('.independent-task')];
+    if (rows.length < tasks.length) return; // 예상보다 단계가 적으면 건드리지 않는다
+    tasks.forEach((task, i) => {
+      const label = rows[i]?.querySelector('.independent-task-copy strong');
+      if (label) label.textContent = task;
+      rows[i]?.querySelector('.task-check')?.setAttribute('aria-label', `${task} 완료 표시`);
+    });
+  });
 }
 
 /**
@@ -424,6 +468,106 @@ function attach() {
     globalThis.renderDeck?.();
   })();
 
+  // ── 실제 제작 흐름: 설문 → 목표 후보 → 프로젝트 ──────────────────
+  // 프로토타입은 목표 후보(decisionGoals)와 할 일(Catalog.projects)을 모두
+  // 카테고리별 고정 표에서 읽어 왔다. 두 지점을 AI 결과로 바꿔 끼운다.
+
+  const PERIOD_TO_DURATION = { 단기: '1주', 중기: '1개월', 장기: '3개월' };
+
+  /** 목표 화면을 그리기 전에 decisionGoals 를 AI 결과로 덮어쓴다. */
+  const baseRenderDecisionGoals = globalThis.renderDecisionGoals;
+  if (typeof baseRenderDecisionGoals === 'function') {
+    globalThis.renderDecisionGoals = async () => {
+      const state = globalThis.state;
+      const decisionGoals = globalThis.decisionGoals;
+      const categories = [...new Set((state?.decisionLikes || []).map((c) => c.category))];
+
+      if (Cloud.ai && decisionGoals && categories.length) {
+        const flow = document.querySelector('#decisionFlow');
+        if (flow) {
+          flow.innerHTML = '<div class="flow-card"><p class="flow-kicker">답변을 읽는 중</p>'
+            + '<h2>고른 키워드에 맞는<br>목표를 만들고 있어요.</h2>'
+            + '<p class="sub">잠시만 기다려 주세요.</p></div>';
+        }
+        const goals = await generateGoalsViaAI({
+          categories,
+          keywords: Cloud.likedKeywords(),
+          survey: surveyAnswers(),
+        });
+        // 받은 카테고리만 갈아끼운다. 실패하면 기존 고정 목표가 그대로 남는다.
+        if (goals) Object.assign(decisionGoals, goals);
+      }
+
+      baseRenderDecisionGoals();
+      wireConfirmButton();
+    };
+  }
+
+  /** 목표 확정 버튼: 프로젝트가 그려지기 전에 할 일을 미리 만들어 둔다. */
+  function wireConfirmButton() {
+    const confirm = document.querySelector('#decisionConfirm');
+    if (!confirm || confirm.dataset.aiWired) return;
+    confirm.dataset.aiWired = 'true';
+
+    const baseOnClick = confirm.onclick;
+    confirm.onclick = async (event) => {
+      const picks = globalThis.state?.decisionGoalsSelected || [];
+      if (!picks.length || !Cloud.ai) return baseOnClick?.call(confirm, event);
+
+      const label = confirm.textContent;
+      confirm.disabled = true;
+      confirm.textContent = '할 일을 만드는 중…';
+      try {
+        await buildTasksFor(picks);
+      } finally {
+        confirm.disabled = false;
+        confirm.textContent = label;
+      }
+      baseOnClick?.call(confirm, event);
+    };
+  }
+
+  /** 선택한 목표마다 할 일을 만들어 localStorage 에 담아 둔다. */
+  async function buildTasksFor(picks) {
+    const interests = Cloud.interests();
+    const keywords = Cloud.likedKeywords();
+
+    const results = await Promise.all(picks.map(async (pick) => {
+      const period = pick.goal?.[1];
+      const ai = await generateProjectViaAI({
+        category: pick.category,
+        duration: PERIOD_TO_DURATION[period] || '1주',
+        interests,
+        likedTitles: keywords,
+        goal: pick.goal?.[0],
+        taskCount: 3, // 프로젝트 카드가 단계 3개로 그려진다
+      });
+      if (!ai?.tasks?.length) return null;
+      persistProject({
+        title: pick.goal?.[0] || ai.title,
+        category: pick.category,
+        keywords: ai.keywords?.length ? ai.keywords : keywords,
+        tasks: ai.tasks,
+      }, PERIOD_TO_DURATION[period] || '1주');
+      return [pick.key, ai.tasks.map((t) => t.content)];
+    }));
+
+    const data = Storage.read();
+    data.aiTasks = data.aiTasks || {};
+    results.filter(Boolean).forEach(([key, tasks]) => { data.aiTasks[key] = tasks; });
+    Storage.write(data);
+  }
+
+  // 프로젝트 카드가 그려질 때마다(신규 생성 · 앱 재시작 복원 모두) 할 일을 입힌다.
+  const baseOpenDecisionProject = globalThis.openDecisionProject;
+  if (typeof baseOpenDecisionProject === 'function') {
+    globalThis.openDecisionProject = (...args) => {
+      const result = baseOpenDecisionProject(...args);
+      applyStoredTasks();
+      return result;
+    };
+  }
+
   // 프로젝트 생성: AI 우선, 실패하면 기존 목업
   const baseCreateProject = MockAPI.createProject.bind(MockAPI);
   MockAPI.createProject = async ({ category, duration }) => {
@@ -459,6 +603,9 @@ function attach() {
     persistProject({ ...project, tasks: ai.tasks }, duration);
     return project;
   };
+
+  // 앱 재시작 시 프로젝트 복원은 이 모듈보다 먼저 끝난다. 그 결과에도 할 일을 입힌다.
+  applyStoredTasks();
 
   logEvent('session_start', { source: 'prototype' });
 }

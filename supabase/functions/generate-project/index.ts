@@ -42,6 +42,8 @@ Deno.serve(async (req: Request) => {
     category?: string;
     interests?: string[];
     likedTitles?: string[];
+    goal?: string;
+    taskCount?: number;
   };
   try {
     payload = await req.json();
@@ -55,7 +57,11 @@ Deno.serve(async (req: Request) => {
     : "기타";
   const interests = (payload.interests ?? []).slice(0, 5);
   const likedTitles = (payload.likedTitles ?? []).slice(0, 10);
-  const taskCount = TASK_COUNT[duration];
+  const goal = String(payload.goal ?? "").trim().slice(0, 60);
+  // 호출자가 개수를 지정할 수 있다. 프로젝트 카드의 단계 수와 정확히 맞춰야 하기 때문이다.
+  const taskCount = Number.isInteger(payload.taskCount)
+    ? Math.min(Math.max(payload.taskCount!, 1), 8)
+    : TASK_COUNT[duration];
 
   const system = [
     "너는 한국의 중학생·고등학생·대학생·취업준비생을 돕는 ODOT의 프로젝트 코치다.",
@@ -71,6 +77,8 @@ Deno.serve(async (req: Request) => {
   ].join("\n");
 
   const user = [
+    goal ? `사용자가 고른 목표: ${goal}` : "",
+    goal ? "할 일은 이 목표를 끝내기 위한 단계여야 한다. 목표와 무관한 일반적인 할 일을 쓰지 않는다." : "",
     `수행 기간: ${duration}`,
     `대표 카테고리: ${category}`,
     interests.length ? `사용자가 고른 관심 분야: ${interests.join(", ")}` : "",
@@ -127,7 +135,7 @@ Deno.serve(async (req: Request) => {
   if (!tasks.length) return json({ error: "empty_tasks" }, 502);
 
   return json({
-    title: String(parsed.title ?? "작은 시작 프로젝트").slice(0, 40),
+    title: goal || String(parsed.title ?? "작은 시작 프로젝트").slice(0, 40),
     category: CATEGORIES.includes(String(parsed.category)) ? parsed.category : category,
     duration,
     keywords: Array.isArray(parsed.keywords)
