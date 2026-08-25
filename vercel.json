@@ -2,6 +2,10 @@
   "cleanUrls": true,
   "rewrites": [
     {
+      "source": "/",
+      "destination": "/odot-prototype.html"
+    },
+    {
       "source": "/(.*)",
       "destination": "/odot-prototype.html"
     }
