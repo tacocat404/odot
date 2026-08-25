@@ -576,7 +576,8 @@ function ensureArchiveDemo(){
   },...(data.completedProjects||[])];
   Storage.write(data);
 }
-ensureArchiveDemo();
+/* 아카이브는 빈 상태로 시작한다. 하지 않은 완료 프로젝트가 기록에 섞이지 않도록
+   데모 시딩(ensureArchiveDemo)은 호출하지 않는다. */
 const archiveRenderReview=renderReview;
 renderReview=async()=>{await archiveRenderReview();};
 const archiveRenderCalendar=renderCalendar;

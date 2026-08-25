@@ -22,6 +22,7 @@ const MIGRATION_FLAG = 'odot-cloud-migrated-v1';
 // 5장으로 시작하고, 2번 카드를 볼 때(current=1, 남은 카드 4장) 6번째를 미리 만든다.
 const INITIAL_CARDS = 5;
 const BUFFER_AHEAD = 4;
+const MAX_PARALLEL_FETCH = 2;
 
 const Cloud = {
   client: null,
@@ -30,7 +31,7 @@ const Cloud = {
   ai: true,
   cardIds: new Map(),        // slug -> keyword_cards.id
   keywordBySlug: new Map(),  // slug -> 키워드 문자열
-  prefetching: false,
+  inFlight: 0,               // 진행 중인 카드 생성 요청 수
 
   interests() {
     return globalThis.Storage?.read?.()?.interests || [];
@@ -321,6 +322,59 @@ async function generateGoalsViaAI({ categories, keywords, survey }) {
   return data?.goals || null;
 }
 
+/* ────────────────────── 생성 중 표시 (공통) ────────────────────── */
+
+/**
+ * 에이전트가 무언가 만드는 동안 쓰는 공통 표시.
+ * 문구는 "밍밍이가 만들고 있어요"로 통일하고, 무엇을 만드는지 한 줄 덧붙인다.
+ */
+function busyCardHTML(detail) {
+  return `<div class="odot-busy">
+    <span class="odot-busy-dot" aria-hidden="true"></span>
+    <strong>밍밍이가 만들고 있어요</strong>
+    <p class="odot-busy-detail" role="status">${detail}</p>
+  </div>`;
+}
+
+/** 3초 넘게 걸리면 문구를 한 번 바꿔 멈춘 게 아님을 알린다. */
+function startBusyCopyRotation(root) {
+  const detail = root?.querySelector('.odot-busy-detail');
+  if (!detail) return;
+  clearTimeout(root._busyTimer);
+  root._busyTimer = setTimeout(() => {
+    if (detail.isConnected) detail.textContent = '조금만 더 기다려 주세요';
+  }, 3000);
+}
+
+/** 뒤 카드에 남은 장수를 은은하게 표시한다(화면을 막지 않는다). */
+function updateBufferHint() {
+  const hint = document.querySelector('.odot-buffer-hint');
+  if (!hint) return;
+  hint.hidden = Cloud.inFlight === 0;
+}
+
+function installBusyStyles() {
+  const style = document.createElement('style');
+  style.textContent = `
+    .odot-busy{display:flex;flex-direction:column;align-items:center;justify-content:center;
+      gap:9px;height:100%;padding:26px;text-align:center}
+    .odot-busy strong{font-size:17px;letter-spacing:-.3px}
+    .odot-busy-detail{margin:0;color:var(--muted);font-size:13px}
+    .odot-busy-dot{width:34px;height:34px;border-radius:50%;
+      background:color-mix(in srgb,var(--primary,#7152a6) 26%,#fff);
+      animation:odotBusyPulse 1.25s ease-in-out infinite}
+    @keyframes odotBusyPulse{0%,100%{transform:scale(.82);opacity:.55}50%{transform:scale(1);opacity:1}}
+    .odot-buffer-hint{display:inline-flex;align-items:center;gap:6px;margin-left:8px;
+      color:var(--muted);font-size:11px;font-weight:800}
+    .odot-buffer-hint:before{content:"";width:6px;height:6px;border-radius:50%;
+      background:var(--primary,#7152a6);animation:odotBusyPulse 1.25s ease-in-out infinite}
+    @media (prefers-reduced-motion:reduce){
+      .odot-busy-dot,.odot-buffer-hint:before{animation:none}
+    }
+  `;
+  document.head.append(style);
+}
+
 /** 설문 문항과 고른 답을 사람이 읽는 문장으로 되돌린다. */
 function surveyAnswers() {
   const questions = globalThis.decisionQuestions || [];
@@ -437,25 +491,62 @@ function attach() {
 
   /**
    * 선버퍼링: 사용자가 카드를 넘기기 "전에" 다음 카드를 만들어 둔다.
-   * 5장으로 시작해 2번 카드를 볼 때 6번째를 만들고, 이후로도 항상 4장을 앞서 확보한다.
-   * → 카드가 넘어가는 순간 생성이 시작되지 않으므로 로딩 대기가 사라진다.
+   *
+   * 이전에는 1장씩만, 그것도 한 번에 한 요청만 보냈다. 1회 생성이 8~15초 걸리므로
+   * 빠르게 넘기면 버퍼가 줄기만 하고 회복하지 못했다.
+   * 이제 부족분을 한 번에 요청하고, 동시 요청을 2건까지 허용한다.
    */
   async function prefetchAhead() {
     const state = globalThis.state;
-    if (!state || Cloud.prefetching || !Cloud.ai) return;
+    if (!state || !Cloud.ai) return;
     if (!state.deck?.[state.current]?.isKeyword) return; // 아직 자리 표시자 덱이면 건너뛴다
-    if (state.deck.length - state.current > BUFFER_AHEAD) return;
 
-    Cloud.prefetching = true;
+    const missing = BUFFER_AHEAD - (state.deck.length - state.current);
+    if (missing <= 0 || Cloud.inFlight >= MAX_PARALLEL_FETCH) return;
+
+    Cloud.inFlight += 1;
+    updateBufferHint();
     try {
-      const fresh = await fetchKeywordCards(1);
+      let fresh = await fetchKeywordCards(Math.min(missing, INITIAL_CARDS));
+      // 조용히 버려지면 그 자리가 영구히 빈다. 한 번은 다시 시도한다.
+      if (!fresh.length) fresh = await fetchKeywordCards(Math.min(missing, INITIAL_CARDS));
       if (fresh.length) {
         state.deck.push(...fresh);
-        globalThis.renderDeck?.(); // 뒤에 쌓인 카드 미리보기를 갱신
+        // 기다리는 사이에 카드가 바닥났을 수 있으므로, 요청 시작 시점이 아니라
+        // "지금 화면에 생성 중 카드가 떠 있는지"로 판단해 실제 카드로 바꿔 준다.
+        const showingBusy = !!document.querySelector('#activeCard .odot-busy');
+        if (showingBusy && state.deck[state.current]) globalThis.renderDeck?.();
+        else refreshUpcoming();
       }
     } finally {
-      Cloud.prefetching = false;
+      Cloud.inFlight -= 1;
+      updateBufferHint();
+      // 여전히 모자라면 이어서 채운다(사용자가 그동안 더 넘겼을 수 있다).
+      if (Cloud.ai && state.deck.length - state.current < BUFFER_AHEAD) prefetchAhead();
     }
+  }
+
+  /**
+   * 뒤에 쌓인 카드 미리보기만 갱신한다.
+   *
+   * renderDeck() 은 #activeCard 의 innerHTML 을 통째로 다시 쓴다. react() 가 카드를
+   * 날려 보낸 뒤 다음 카드를 그리기까지 180ms 가 걸리는데, 그 사이에 버퍼 응답이
+   * 도착해 전체를 다시 그리면 날아가는 중인 카드가 교체되어 번쩍이며 겹쳐 보였다.
+   * 그래서 현재 카드는 건드리지 않고 뒤 카드만 손본다.
+   */
+  function refreshUpcoming() {
+    const state = globalThis.state;
+    if (!state) return;
+    ['.back-1', '.back-2'].forEach((selector, i) => {
+      const el = document.querySelector(selector);
+      if (!el) return;
+      const next = state.deck[state.current + i + 1];
+      el.dataset.color = next?.color || 'gray';
+      el.innerHTML = next
+        ? `<span class="topic-tag">다음 추천</span><h2>${String(next.title).replace('\n', '<br>')}</h2>`
+        : '';
+    });
+    updateBufferHint();
   }
 
   // 카드를 넘길 때마다 버퍼를 채운다(응답을 기다리지 않는다).
@@ -464,6 +555,30 @@ function attach() {
     globalThis.react = async (type) => {
       await baseReact(type);
       prefetchAhead();
+    };
+  }
+
+  /**
+   * 카드가 바닥났을 때 프로토타입의 빈 상태 대신 생성 중 카드를 보여 준다.
+   *
+   * react() 는 다음 카드를 180ms 뒤에 그리므로, 넘긴 직후에 표시를 끼워 넣으면
+   * 곧바로 덮어써진다. 그래서 renderDeck 자체를 감싼다.
+   */
+  const baseRenderDeck = globalThis.renderDeck;
+  if (typeof baseRenderDeck === 'function') {
+    globalThis.renderDeck = (...args) => {
+      const state = globalThis.state;
+      const card = document.querySelector('#activeCard');
+      if (Cloud.ai && state && card && !state.deck?.[state.current]) {
+        card.style.transform = '';
+        card.style.opacity = '1';
+        card.dataset.color = 'gray';
+        card.innerHTML = busyCardHTML('다음 키워드를 고르는 중');
+        startBusyCopyRotation(card);
+        refreshUpcoming();
+        return;
+      }
+      return baseRenderDeck(...args);
     };
   }
 
@@ -494,11 +609,50 @@ function attach() {
   `;
   document.head.append(keywordStyle);
 
-  // 첫 진입: 트렌드 키워드 덱을 받아 자리 표시자를 교체한다.
+  installBusyStyles();
+
+  // 남은 카드를 채우는 중임을 알리는 은은한 표시(화면을 막지 않는다).
+  const likedCount = document.querySelector('#likedCount');
+  if (likedCount && !document.querySelector('.odot-buffer-hint')) {
+    const hint = document.createElement('span');
+    hint.className = 'odot-buffer-hint';
+    hint.textContent = '카드 준비 중';
+    hint.hidden = true;
+    likedCount.insertAdjacentElement('afterend', hint);
+  }
+
+  // 키보드만으로도 카드에 반응할 수 있게 한다(하단 버튼 제거 대비).
+  document.addEventListener('keydown', (event) => {
+    if (document.querySelector('#explore')?.classList.contains('active') !== true) return;
+    if (event.target.closest('input, textarea, button')) return;
+    const map = { ArrowLeft: 'pass', ArrowRight: 'like' };
+    if (map[event.key]) { event.preventDefault(); globalThis.react?.(map[event.key]); }
+    else if (event.key === 'ArrowUp') { event.preventDefault(); globalThis.openSheet?.('#summarySheet'); }
+    else if (event.key === 'ArrowDown') { event.preventDefault(); globalThis.startDecision?.(); }
+  });
+
+  // 첫 진입: 내장 더미 카드를 먼저 보여 주지 않고, 생성 중 상태로 연다.
   (async () => {
     const state = globalThis.state;
+    const card = document.querySelector('#activeCard');
+    if (!state || !card) return;
+
+    if (Cloud.ai) {
+      state.deck = [];
+      state.current = 0;
+      card.dataset.color = 'gray';
+      card.innerHTML = busyCardHTML('오늘의 키워드를 고르는 중');
+      startBusyCopyRotation(card);
+    }
+
     const cards = await fetchKeywordCards(INITIAL_CARDS);
-    if (!cards.length || !state) return;
+    if (!cards.length) {
+      // AI 를 못 쓰면 프로토타입의 내장 덱으로 되돌아간다.
+      state.deck = await baseGetRecommendations();
+      state.current = 0;
+      globalThis.renderDeck?.();
+      return;
+    }
     if (state.current > 0) return; // 이미 넘기기 시작했으면 흐름을 끊지 않는다
     state.deck = cards;
     state.current = 0;
@@ -679,7 +833,7 @@ function attach() {
         .eq('reaction', 'like')
         .gte('created_at', start.toISOString());
       if (error) throw error;
-      if (!data?.length) return null;
+      if (!data?.length) return [];
 
       const counts = new Map();
       data.forEach((row) => counts.set(row.category, (counts.get(row.category) || 0) + 1));
@@ -688,7 +842,7 @@ function attach() {
         .slice(0, 5)
         .map(([category, count]) => ({ category, count, change: `+${count}` }));
     });
-    return ranks || baseGetReview();
+    return ranks ?? baseGetReview();
   };
 
   /** F-IYXFDA · 일별 완료 카테고리 */
@@ -700,7 +854,7 @@ function attach() {
         .select('day, category, completed_count')
         .eq('user_id', Cloud.userId);
       if (error) throw error;
-      if (!data?.length) return null;
+      if (!data?.length) return [];
       // 화면은 완료 1건당 한 줄을 기대한다. 집계를 다시 펼친다.
       return data.flatMap((row) =>
         Array.from({ length: row.completed_count }, () => ({
@@ -708,8 +862,57 @@ function attach() {
           category: row.category,
         })));
     });
-    return rows || baseGetCompletions();
+    return rows ?? baseGetCompletions();
   };
+
+  /** 인사이트 히트맵 · 잔디: 8월치 목업 대신 실제 기록 */
+  const baseGetDailyInterest = MockAPI.getDailyInterest?.bind(MockAPI);
+  if (baseGetDailyInterest) {
+    MockAPI.getDailyInterest = async () => {
+      const rows = await safe('getDailyInterest', async () => {
+        const { data, error } = await Cloud.client
+          .from('card_reactions')
+          .select('category, created_at')
+          .eq('user_id', Cloud.userId)
+          .eq('reaction', 'like');
+        if (error) throw error;
+        if (!data?.length) return [];
+
+        // 화면은 날짜·카테고리별 건수를 기대한다.
+        const counts = new Map();
+        data.forEach((row) => {
+          const date = new Date(row.created_at).toLocaleDateString('sv-SE'); // YYYY-MM-DD
+          const key = `${date}|${row.category}`;
+          counts.set(key, (counts.get(key) || 0) + 1);
+        });
+        return [...counts].map(([key, count]) => {
+          const [date, category] = key.split('|');
+          return { date, category, count };
+        });
+      });
+      return rows ?? baseGetDailyInterest();
+    };
+  }
+
+  const baseGetStreakActivity = MockAPI.getStreakActivity?.bind(MockAPI);
+  if (baseGetStreakActivity) {
+    MockAPI.getStreakActivity = async () => {
+      const rows = await safe('getStreakActivity', async () => {
+        const { data, error } = await Cloud.client
+          .from('daily_category_summary')
+          .select('day, category, completed_count')
+          .eq('user_id', Cloud.userId);
+        if (error) throw error;
+        if (!data?.length) return [];
+        return data.map((row) => ({
+          date: row.day,
+          category: row.category,
+          count: row.completed_count,
+        }));
+      });
+      return rows ?? baseGetStreakActivity();
+    };
+  }
 
   // 앱 재시작 시 프로젝트 복원은 이 모듈보다 먼저 끝난다. 그 결과에도 할 일을 입힌다.
   applyStoredTasks();
