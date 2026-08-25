@@ -52,8 +52,10 @@ const Cloud = {
     return [...new Set([...archived, ...finished])].slice(0, 10);
   },
   /**
-   * 프로필 관심 카드함에 보관 중인 카드 (추천의 "취향 심화" 재료).
-   * 좋아요는 했지만 아직 프로젝트로 쓰지 않은, 지금도 살아 있는 관심이다.
+   * 관심 카드 — 프로필 카드함에 보관 중인 카드.
+   *
+   * 쓰이는 곳은 '카드 생성'뿐이다. 무엇을 더 보여 줄지 고를 때 취향으로 참고한다.
+   * 프로젝트를 만들 때는 쓰지 않는다. 그건 프로젝트 카드의 몫이다.
    */
   savedCards() {
     const cards = globalThis.Storage?.read?.()?.cardStore?.cards || [];
@@ -61,7 +63,11 @@ const Cloud = {
       .filter(Boolean)
       .slice(0, 12);
   },
-  /** 좋아요한 카드의 키워드 목록 (to-do 생성의 재료) */
+  /**
+   * 지금까지 좋아요한 키워드 전체.
+   * 이것도 '카드 생성'에서만 쓴다. 프로젝트 생성에 넣으면 이번에 고르지 않은
+   * 예전 주제가 목표와 할 일에 섞여 들어온다.
+   */
   likedKeywords() {
     const reactions = globalThis.Storage?.read?.()?.reactions || [];
     return reactions
@@ -411,20 +417,24 @@ async function generateProjectViaAI({ category, duration, interests, likedTitles
 }
 
 /**
- * F-URTMLV · 좋아요한 키워드로 설문 문항 생성
+ * F-URTMLV · 프로젝트 카드로 설문 문항 생성
+ *
+ * 설문은 프로젝트를 만드는 흐름의 일부다. 그러므로 지금 후보로 올라온
+ * 프로젝트 카드만 본다. 예전에 좋아요했던 주제는 여기 끼어들지 않는다.
  * 카드를 넘기는 동안 미리 만들어 두어, 설문 진입에서 기다리지 않게 한다.
  */
 async function prepareSurvey() {
   if (!Cloud.ai || Cloud.surveyPending) return;
-  const keywords = Cloud.likedKeywords();
+  const cards = currentRunCards();
+  const keywords = cards.map((c) => c.title);
   if (!keywords.length) return;
-  // 좋아요한 키워드가 그대로면 이미 만든 설문을 다시 쓴다.
+  // 후보 카드가 그대로면 이미 만든 설문을 다시 쓴다.
   const signature = keywords.join('|');
   if (Cloud.surveySignature === signature) return;
 
   Cloud.surveyPending = true;
   try {
-    const categories = [...new Set((globalThis.state?.decisionLikes || []).map((c) => c.category))];
+    const categories = [...new Set(cards.map((c) => c.category))];
     const data = await invoke('generate-survey', { keywords, categories });
     if (data?.questions?.length) {
       Cloud.survey = data.questions;
@@ -485,11 +495,11 @@ async function generateGoalsViaAI({ categories, keywords, survey, cards }) {
 }
 
 /**
- * 이번 프로젝트를 만드는 카드들.
+ * 프로젝트 카드 — 이번 프로젝트를 만드는 후보 카드들.
  *
- * 예전에는 목표를 만들 때 Cloud.likedKeywords() — 지금까지의 좋아요 이력 전체 —
- * 를 넘겼다. 그래서 이번에 고르지 않은 예전 관심사로 목표가 나왔다.
- * (배드민턴 카드를 안 골랐는데 배드민턴 목표가 나오는 식)
+ * 프로젝트 생성 흐름(설문 · 목표 · 할 일)은 오직 이것만 본다.
+ * 예전에는 여기에 좋아요 이력 전체를 넘겨서, 이번에 고르지 않은 주제로
+ * 목표가 나왔다(배드민턴 카드를 안 골랐는데 배드민턴 목표가 나오는 식).
  */
 function currentRunCards() {
   return (globalThis.state?.decisionLikes || []).map((card) => ({
@@ -723,13 +733,17 @@ function attach() {
   const Catalog = globalThis.Catalog;
   if (!MockAPI || !Storage) return;
 
-  const likedContext = () => ({
-    interests: Cloud.interests(),
-    likedCategories: (Storage.read().reactions || [])
-      .filter((r) => r.type === 'like')
-      .map((r) => r.category),
-    likedTitles: Cloud.likedKeywords(),
-  });
+  // 프로젝트 생성 경로에서 쓰는 맥락. 카드 생성과 달리 좋아요 이력은 보지 않고,
+  // 이번에 후보로 올라온 프로젝트 카드만 본다.
+  const likedContext = () => {
+    const cards = currentRunCards();
+    return {
+      interests: Cloud.interests(),
+      likedCategories: [...new Set(cards.map((c) => c.category))],
+      likedTitles: cards.map((c) => c.title),
+      cards,
+    };
+  };
 
   // 관심사 저장 미러
   const baseSaveInterests = MockAPI.saveInterests.bind(MockAPI);
@@ -1573,6 +1587,7 @@ function attach() {
       duration,
       interests: ctx.interests,
       likedTitles: ctx.likedTitles,
+      cards: ctx.cards,
     });
 
     if (!ai) {
