@@ -29,6 +29,7 @@ const Cloud = {
   userId: null,
   online: false,
   ai: true,
+  isAnonymous: true,
   cardIds: new Map(),        // slug -> keyword_cards.id
   keywordBySlug: new Map(),  // slug -> 키워드 문자열
   inFlight: 0,               // 진행 중인 카드 생성 요청 수
@@ -92,6 +93,7 @@ async function boot() {
 
   Cloud.client = client;
   Cloud.userId = session.user.id;
+  Cloud.isAnonymous = Boolean(session.user.is_anonymous);
   Cloud.online = true;
 
   await cacheGlobalCards();
@@ -372,6 +374,91 @@ function applySurvey() {
 async function generateGoalsViaAI({ categories, keywords, survey }) {
   const data = await invoke('generate-goals', { categories, keywords, survey });
   return data?.goals || null;
+}
+
+/* ──────────────────────────── 계정 ──────────────────────────── */
+
+/**
+ * 회원가입 · 로그인
+ *
+ * 사용자는 익명 세션으로 먼저 앱을 쓴다. 가입할 때는 새 계정을 만드는 대신
+ * 그 익명 계정을 정식 계정으로 '승격'한다. user.id 가 그대로 유지되므로
+ * 지금까지 모은 관심 카드·프로젝트·완료 기록이 전부 따라온다.
+ */
+async function signUpWithEmail({ email, password, name }) {
+  const { data: { user } } = await Cloud.client.auth.getUser();
+  const upgrading = Boolean(user?.is_anonymous);
+
+  if (upgrading) {
+    const { error } = await Cloud.client.auth.updateUser({
+      email,
+      password,
+      data: { display_name: name || null },
+    });
+    // 확인 메일을 기다리는 중에 같은 값으로 다시 누르면 비밀번호가 이미 설정돼 있어
+    // 거부된다. 가입이 진행 중이라는 뜻이므로 오류가 아니라 대기로 처리한다.
+    if (error && /different from the old password/i.test(error.message || '')) {
+      return { pending: true };
+    }
+    if (error) throw error;
+  } else {
+    const { error } = await Cloud.client.auth.signUp({
+      email,
+      password,
+      options: { data: { display_name: name || null } },
+    });
+    if (error) throw error;
+  }
+
+  // 프로젝트에서 이메일 확인이 켜져 있으면 이메일이 아직 계정에 붙지 않는다.
+  // 그 상태로 화면을 넘기면 가입된 것처럼 보이지만 실제로는 여전히 익명이다.
+  const { data: { user: after } } = await Cloud.client.auth.getUser();
+  if (!after?.email || after?.is_anonymous) {
+    return { pending: true };
+  }
+
+  await refreshIdentity(name);
+  logEvent('sign_up', { upgraded: upgrading });
+  return { pending: false };
+}
+
+async function signInWithEmail({ email, password }) {
+  const { error } = await Cloud.client.auth.signInWithPassword({ email, password });
+  if (error) throw error;
+  await refreshIdentity();
+  logEvent('sign_in', {});
+}
+
+/** 세션이 바뀐 뒤 화면이 읽는 로컬 프로필과 DB 프로필을 맞춘다. */
+async function refreshIdentity(name) {
+  const { data: { user } } = await Cloud.client.auth.getUser();
+  if (!user) return;
+
+  Cloud.userId = user.id;
+  Cloud.isAnonymous = Boolean(user.is_anonymous);
+
+  const displayName = name || user.user_metadata?.display_name || (user.email || '').split('@')[0];
+  const store = globalThis.Storage?.read?.() || {};
+  store.profile = { ...(store.profile || {}), email: user.email || '', name: displayName, signedIn: true };
+  globalThis.Storage?.write?.(store);
+
+  await safe('syncProfileName', async () => {
+    await Cloud.client.from('profiles').update({ display_name: displayName }).eq('id', user.id);
+  });
+}
+
+/** Supabase 오류를 사람이 읽을 수 있는 안내로 바꾼다. */
+function authMessage(err) {
+  const raw = String(err?.message || err || '');
+  if (/already registered|already been registered|User already exists/i.test(raw)) {
+    return '이미 가입된 이메일이에요. 로그인해 주세요.';
+  }
+  if (/Invalid login credentials/i.test(raw)) return '이메일이나 비밀번호가 맞지 않아요.';
+  if (/Password should be at least/i.test(raw)) return '비밀번호는 6자 이상이어야 해요.';
+  if (/Unable to validate email|invalid format/i.test(raw)) return '이메일 형식을 확인해 주세요.';
+  if (/Email not confirmed/i.test(raw)) return '메일함에서 확인 링크를 눌러 주세요.';
+  if (/rate limit|too many/i.test(raw)) return '요청이 많아요. 잠시 뒤 다시 시도해 주세요.';
+  return '문제가 생겼어요. 잠시 뒤 다시 시도해 주세요.';
 }
 
 /* ────────────────────── 생성 중 표시 (공통) ────────────────────── */
@@ -694,6 +781,177 @@ function attach() {
     hint.textContent = '카드 준비 중';
     hint.hidden = true;
     likedCount.insertAdjacentElement('afterend', hint);
+  }
+
+  /* ── 계정 화면: 하드코딩 데모 로그인을 실제 인증으로 교체 ──────────
+     기존 화면은 demo@odot.app / odot1234 를 문자열로 비교하기만 했다. */
+  installAuthScreen();
+
+  function installAuthScreen() {
+    const card = document.querySelector('#login .auth-card');
+    const form = document.querySelector('#loginForm');
+    if (!card || !form) return;
+
+    card.querySelector('.demo-account')?.remove();
+    // 화면의 h1/sub 는 모드에 따라 바꿔 쓴다.
+    const heading = card.querySelector('h1');
+    const sub = card.querySelector('.sub');
+
+    form.innerHTML = `
+      <div class="auth-tabs" role="tablist">
+        <button type="button" class="auth-tab selected" data-mode="signup" role="tab" aria-selected="true">회원가입</button>
+        <button type="button" class="auth-tab" data-mode="signin" role="tab" aria-selected="false">로그인</button>
+      </div>
+      <label for="authName" data-signup-only>닉네임</label>
+      <input id="authName" type="text" maxlength="12" autocomplete="nickname" placeholder="밍밍이" data-signup-only>
+      <label for="loginEmail">이메일</label>
+      <input id="loginEmail" type="email" autocomplete="email" required placeholder="odot@example.com">
+      <label for="loginPassword">비밀번호</label>
+      <input id="loginPassword" type="password" autocomplete="new-password" required minlength="6" placeholder="6자 이상">
+      <button class="primary" type="submit">가입하고 시작하기</button>
+      <p class="auth-help" id="authHelp" role="status" aria-live="polite"></p>
+    `;
+
+    const help = form.querySelector('#authHelp');
+    const submit = form.querySelector('button[type="submit"]');
+    let mode = 'signup';
+
+    const applyMode = () => {
+      const signup = mode === 'signup';
+      form.querySelectorAll('[data-signup-only]').forEach((el) => { el.hidden = !signup; });
+      form.querySelectorAll('.auth-tab').forEach((tab) => {
+        const on = tab.dataset.mode === mode;
+        tab.classList.toggle('selected', on);
+        tab.setAttribute('aria-selected', String(on));
+      });
+      submit.textContent = signup ? '가입하고 시작하기' : '로그인';
+      form.querySelector('#loginPassword').autocomplete = signup ? 'new-password' : 'current-password';
+      if (heading) {
+        heading.innerHTML = signup
+          ? '기록을 지키려면<br>계정이 필요해요.'
+          : '다시 만나서<br>반가워요.';
+      }
+      if (sub) {
+        sub.textContent = signup
+          ? '지금까지 모은 관심 카드는 그대로 이어집니다.'
+          : '쓰던 계정으로 이어서 시작해요.';
+      }
+      help.textContent = '';
+    };
+
+    form.querySelectorAll('.auth-tab').forEach((tab) => {
+      tab.onclick = () => { mode = tab.dataset.mode; applyMode(); };
+    });
+
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      const email = form.querySelector('#loginEmail').value.trim();
+      const password = form.querySelector('#loginPassword').value;
+      const name = form.querySelector('#authName').value.trim();
+
+      if (!email || !password) { help.textContent = '이메일과 비밀번호를 입력해 주세요.'; return; }
+      if (mode === 'signup' && password.length < 6) {
+        help.textContent = '비밀번호는 6자 이상이어야 해요.';
+        return;
+      }
+
+      const label = submit.textContent;
+      submit.disabled = true;
+      submit.textContent = mode === 'signup' ? '가입하는 중…' : '로그인하는 중…';
+      help.textContent = '';
+      help.style.color = '';
+
+      try {
+        if (mode === 'signup') {
+          const { pending } = await signUpWithEmail({ email, password, name });
+          if (pending) {
+            help.textContent = `${email} 로 확인 메일을 보냈어요. 링크를 누른 뒤 로그인해 주세요.`;
+            help.style.color = 'var(--muted)';
+            return;
+          }
+        } else {
+          await signInWithEmail({ email, password });
+        }
+
+        // 가입 직후에는 관심사부터 고르게 한다.
+        const interests = Cloud.interests();
+        globalThis.showScreen?.(interests.length ? 'explore' : 'interests');
+        globalThis.toast?.(`${name || email.split('@')[0]}님, 반가워요.`);
+      } catch (err) {
+        console.warn('[odot-cloud] auth', err?.message || err);
+        help.textContent = authMessage(err);
+      } finally {
+        submit.disabled = false;
+        submit.textContent = label;
+      }
+    };
+
+    applyMode();
+
+    const authStyle = document.createElement('style');
+    authStyle.textContent = `
+      .auth-tabs{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:6px;
+        padding:4px;border-radius:14px;background:#f1ece4}
+      .auth-tab{min-height:40px;border:0;border-radius:11px;background:transparent;
+        color:var(--muted);font:inherit;font-size:13px;font-weight:900;cursor:pointer}
+      .auth-tab.selected{background:#fff;color:var(--ink);box-shadow:0 2px 6px #5a3b7118}
+      .auth-help{min-height:18px;margin:8px 0 0;color:#b3352f;font-size:12px;line-height:1.45}
+      #loginForm [hidden]{display:none!important}
+      .anon-notice{position:relative;z-index:1;display:flex;flex-direction:column;gap:3px;
+        width:100%;margin-top:14px;padding:12px 14px;border:0;border-radius:15px;
+        background:#ffffffcc;text-align:left;font:inherit;cursor:pointer}
+      .anon-notice strong{font-size:13px}
+      .anon-notice span{color:var(--muted);font-size:11.5px;line-height:1.5}
+    `;
+    document.head.append(authStyle);
+  }
+
+  // 로그아웃: 세션을 비우고 새 익명 세션으로 되돌린다.
+  // renderProfile 이 프로필 화면을 통째로 다시 그리므로 렌더할 때마다 다시 연결한다.
+  function bindLogout() {
+    const logoutBtn = document.querySelector('#logout');
+    if (!logoutBtn || logoutBtn.dataset.cloudBound) return;
+    logoutBtn.dataset.cloudBound = 'true';
+
+    logoutBtn.onclick = async () => {
+      await safe('signOut', async () => { await Cloud.client.auth.signOut(); });
+      // 로그아웃해도 앱은 계속 쓸 수 있어야 하므로 익명 세션을 새로 연다.
+      await safe('anonAgain', async () => {
+        const { data } = await Cloud.client.auth.signInAnonymously();
+        if (data?.user) { Cloud.userId = data.user.id; Cloud.isAnonymous = true; }
+      });
+      const store = Storage.read();
+      store.profile = { ...(store.profile || {}), email: '', name: '밍밍이', signedIn: false };
+      Storage.write(store);
+      globalThis.showScreen?.('login');
+      globalThis.toast?.('로그아웃했어요.');
+    };
+  }
+
+  // 프로필은 렌더할 때마다 통째로 다시 그려진다. 그때마다 로그아웃을 다시 잇고,
+  // 아직 익명이면 기록을 지키라는 안내를 얹는다.
+  const baseRenderProfile = globalThis.renderProfile;
+  if (typeof baseRenderProfile === 'function') {
+    globalThis.renderProfile = (...args) => {
+      const result = baseRenderProfile(...args);
+      bindLogout();
+      showAnonymousNotice();
+      return result;
+    };
+  }
+
+  /** 익명 상태에서는 기록이 이 기기에만 남는다는 것을 알려 준다. */
+  function showAnonymousNotice() {
+    if (!Cloud.isAnonymous) return;
+    const hero = document.querySelector('#profile .profile-hero');
+    if (!hero || hero.querySelector('.anon-notice')) return;
+    const notice = document.createElement('button');
+    notice.type = 'button';
+    notice.className = 'anon-notice';
+    notice.innerHTML = '<strong>아직 계정이 없어요</strong>'
+      + '<span>가입하면 지금까지 모은 관심 카드가 안전하게 보관돼요.</span>';
+    notice.onclick = () => globalThis.showScreen?.('login');
+    hero.append(notice);
   }
 
   /* ── C-2 · 조작을 스와이프로 통일 ─────────────────────────────
