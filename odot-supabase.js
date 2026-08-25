@@ -1301,9 +1301,164 @@ function attach() {
       applyStoredTasks();
       bindCompletionSync();
       showOriginCards();
+      addProjectControls();
       return result;
     };
   }
+
+  /* ── 프로젝트 삭제 · 기한 다시 잡기 ─────────────────────────────
+     프로젝트는 한번 만들면 지울 수 없었고, 마감이 지나도 D-0 에 멈춘 채
+     그대로 남아 있었다. 둘 다 카드 안에서 처리한다. */
+
+  const PERIOD_DAYS_MAP = { 단기: 7, 중기: 28, 장기: 84 };
+
+  function addProjectControls() {
+    document.querySelectorAll('.separate-project').forEach((project) => {
+      if (project.dataset.controlsAdded) return;
+      project.dataset.controlsAdded = 'true';
+
+      const key = project.dataset.projectKey;
+      const record = (Storage.read().activeProjects || []).find((p) => p.key === key);
+      const foot = project.querySelector('.separate-project-foot');
+      if (!foot) return;
+
+      foot.insertAdjacentHTML('afterend',
+        `<div class="project-controls">
+          <button type="button" class="project-control" data-act="reschedule">기한 다시 잡기</button>
+          <button type="button" class="project-control danger" data-act="delete">삭제</button>
+        </div>`);
+
+      project.querySelector('[data-act="delete"]').onclick = () => confirmDelete(project, key);
+      project.querySelector('[data-act="reschedule"]').onclick = () => reschedule(project, key, record);
+
+      showOverdueNotice(project, key, record);
+    });
+  }
+
+  /** 마감이 지났으면 조용히 두지 않고 다시 잡자고 제안한다. */
+  function showOverdueNotice(project, key, record) {
+    if (!record?.startedAt) return;
+    const days = PERIOD_DAYS_MAP[record.goal?.[1]] || 28;
+    const due = new Date(`${record.startedAt}T00:00:00`);
+    due.setDate(due.getDate() + days);
+    const over = Math.floor((Date.now() - due.getTime()) / 86400000);
+    if (over <= 0) return;
+
+    const done = (record.done || []).length;
+    const total = project.querySelectorAll('.independent-task').length || 1;
+    project.querySelector('.separate-project-head')?.insertAdjacentHTML('afterend',
+      `<div class="project-overdue">
+        <strong>마감일에서 ${over}일 지났어요.</strong>
+        <span>${done} / ${total} 만큼 왔어요. 이번엔 어려웠던 것뿐이니 기한만 다시 잡아 볼까요?</span>
+        <button type="button" class="project-control" data-act="reschedule-now">기한 다시 잡기</button>
+      </div>`);
+    project.querySelector('[data-act="reschedule-now"]').onclick =
+      () => reschedule(project, key, record);
+  }
+
+  /** 시작일을 오늘로 옮겨 남은 기간을 되돌려 준다. */
+  function reschedule(project, key, record) {
+    const list = Storage.read().activeProjects || [];
+    const target = record || list.find((p) => p.key === key);
+    if (!target) return;
+
+    const today = new Date().toLocaleDateString('sv-SE');
+    const next = list.map((p) => (p.key === key ? { ...p, startedAt: today } : p));
+    const store = Storage.read();
+    store.activeProjects = next;
+    Storage.write(store);
+
+    logEvent('project_rescheduled', { key });
+    globalThis.toast?.('오늘부터 다시 시작이에요.');
+    // 날짜 표시를 새로 그리려면 프로젝트 화면을 다시 연다.
+    globalThis.state.decisionGoalsSelected = [];
+    globalThis.openDecisionProject?.();
+  }
+
+  function confirmDelete(project, key) {
+    if (project.querySelector('.project-confirm')) return;
+    project.insertAdjacentHTML('beforeend',
+      `<div class="project-confirm">
+        <strong>이 프로젝트를 지울까요?</strong>
+        <span>할 일과 남긴 기록도 함께 사라져요. 되돌릴 수 없어요.</span>
+        <div class="project-confirm-row">
+          <button type="button" class="project-control" data-act="cancel">그대로 두기</button>
+          <button type="button" class="project-control danger" data-act="confirm">지우기</button>
+        </div>
+      </div>`);
+    project.querySelector('[data-act="cancel"]').onclick =
+      () => project.querySelector('.project-confirm')?.remove();
+    project.querySelector('[data-act="confirm"]').onclick = () => deleteProject(key);
+  }
+
+  async function deleteProject(key) {
+    const store = Storage.read();
+    const taskIds = store.aiTaskIds?.[key] || [];
+
+    // DB 먼저 지운다. tasks 는 project 에 걸린 on delete cascade 로 함께 사라진다.
+    await safe('deleteProject', async () => {
+      if (!taskIds.length) return;
+      const { data } = await Cloud.client
+        .from('tasks').select('project_id').eq('id', taskIds[0]).maybeSingle();
+      if (data?.project_id) {
+        await Cloud.client.from('projects').delete()
+          .eq('id', data.project_id).eq('user_id', Cloud.userId);
+      }
+    });
+
+    store.activeProjects = (store.activeProjects || []).filter((p) => p.key !== key);
+    delete store.aiTasks?.[key];
+    delete store.aiTaskIds?.[key];
+    store.checkins = (store.checkins || []).filter((c) => c.project !== key);
+    store.taskNotes = (store.taskNotes || []).filter((n) => n.project !== key);
+    Storage.write(store);
+
+    logEvent('project_deleted', { key });
+    globalThis.toast?.('프로젝트를 지웠어요.');
+
+    // 프로토타입의 재렌더는 남은 프로젝트가 없으면 조기 반환하며 DOM 을 그대로 둔다.
+    // 그래서 카드는 직접 걷어낸다.
+    document.querySelector(`.separate-project[data-project-key="${key}"]`)?.remove();
+    globalThis.state.decisionGoalsSelected =
+      (globalThis.state.decisionGoalsSelected || []).filter((p) => p.key !== key);
+    globalThis.state.activeProjectPicks =
+      (globalThis.state.activeProjectPicks || []).filter((p) => p.key !== key);
+
+    const left = document.querySelectorAll('.separate-project').length;
+    const counter = document.querySelector('.independent-project-count');
+    if (counter) counter.textContent = `${left}개`;
+    const signal = document.querySelector('#projectSignal');
+    if (signal) signal.textContent = left ? `진행 중 ${left}개` : '내 프로젝트';
+
+    if (!left) {
+      // 마지막 하나였으면 "아직 시작한 프로젝트가 없어요" 상태로 되돌린다.
+      const ready = document.querySelector('#projectReady');
+      const locked = document.querySelector('#projectLocked');
+      if (ready) { ready.hidden = true; ready.innerHTML = ''; ready.classList.remove('project-has-result'); }
+      if (locked) locked.hidden = false;
+      globalThis.renderProjects?.();
+    }
+  }
+
+  const projectControlStyle = document.createElement('style');
+  projectControlStyle.textContent = `
+    .project-controls{display:flex;gap:8px;justify-content:flex-end;margin:0 10px 12px}
+    .project-control{min-height:34px;padding:0 12px;border:1px solid var(--line);
+      border-radius:11px;background:#fff;color:var(--muted);font:inherit;font-size:11.5px;
+      font-weight:800;cursor:pointer}
+    .project-control.danger{border-color:#e7cdcb;color:#b3352f}
+    .project-overdue{display:flex;flex-direction:column;gap:5px;align-items:flex-start;
+      margin:0 10px 10px;padding:11px 13px;border-radius:13px;background:#fbf0df}
+    .project-overdue strong{font-size:12.5px;color:#8a5410}
+    .project-overdue span{color:#8a5410;font-size:11px;line-height:1.5}
+    .project-overdue .project-control{margin-top:4px;background:#fff;border-color:#e9d4ae;color:#8a5410}
+    .project-confirm{display:flex;flex-direction:column;gap:4px;margin:0 10px 12px;
+      padding:12px 13px;border:1px solid #e7cdcb;border-radius:13px;background:#f9e9e8}
+    .project-confirm strong{font-size:12.5px;color:#b3352f}
+    .project-confirm span{color:#8a4a46;font-size:11px;line-height:1.5}
+    .project-confirm-row{display:flex;gap:8px;margin-top:6px}
+  `;
+  document.head.append(projectControlStyle);
 
   /**
    * 이 프로젝트를 만든 발견 카드를 실제로 보여 준다.
@@ -1563,9 +1718,12 @@ function attach() {
     };
   }
 
-  // 앱 재시작 시 프로젝트 복원은 이 모듈보다 먼저 끝난다. 그 결과에도 할 일을 입힌다.
+  // 앱 재시작 시 프로젝트 복원은 이 모듈보다 먼저 끝난다.
+  // 그 결과에도 할 일·출처 카드·조작 버튼을 똑같이 입힌다.
   applyStoredTasks();
   bindCompletionSync();
+  showOriginCards();
+  addProjectControls();
 
   logEvent('session_start', { source: 'prototype' });
 }
