@@ -116,9 +116,8 @@ async function activateSession(user) {
  * 프로젝트가 새 계정 화면에 그대로 남는다.
  */
 function resetLocalState() {
-  const store = globalThis.Storage?.read?.() || {};
-  const profile = store.profile;
-  globalThis.Storage?.write?.({ interests: [], reactions: [], projects: [], profile });
+  // 프로필도 계정에 딸린 값이다. 남겨 두면 앞 계정의 이름·아바타가 그대로 보인다.
+  globalThis.Storage?.write?.({ interests: [], reactions: [], projects: [] });
 
   Cloud.keywordBySlug.clear();
   Cloud.survey = null;
@@ -479,10 +478,25 @@ function checkCustomInterest(raw) {
   return null;
 }
 
-/** F-URTMLV · 설문 답변 + 좋아요한 키워드 → 카테고리별 목표 후보 */
-async function generateGoalsViaAI({ categories, keywords, survey }) {
-  const data = await invoke('generate-goals', { categories, keywords, survey });
+/** F-URTMLV · 이번에 고른 카드 + 설문 답변 → 카테고리별 목표 후보 */
+async function generateGoalsViaAI({ categories, keywords, survey, cards }) {
+  const data = await invoke('generate-goals', { categories, keywords, survey, cards });
   return data?.goals || null;
+}
+
+/**
+ * 이번 프로젝트를 만드는 카드들.
+ *
+ * 예전에는 목표를 만들 때 Cloud.likedKeywords() — 지금까지의 좋아요 이력 전체 —
+ * 를 넘겼다. 그래서 이번에 고르지 않은 예전 관심사로 목표가 나왔다.
+ * (배드민턴 카드를 안 골랐는데 배드민턴 목표가 나오는 식)
+ */
+function currentRunCards() {
+  return (globalThis.state?.decisionLikes || []).map((card) => ({
+    title: String(card.title || '').replace('\n', ' ').trim(),
+    category: card.category,
+    intro: card.intro || '',
+  })).filter((card) => card.title);
 }
 
 /* ──────────────────────────── 계정 ──────────────────────────── */
@@ -540,12 +554,28 @@ async function refreshIdentity(name) {
 
   const displayName = name || user.user_metadata?.display_name || (user.email || '').split('@')[0];
   const store = globalThis.Storage?.read?.() || {};
-  store.profile = { ...(store.profile || {}), email: user.email || '', name: displayName, signedIn: true };
+  store.profile = {
+    ...(store.profile || {}),
+    email: user.email || '',
+    name: displayName,
+    signedIn: true,
+    // 아바타는 밍밍이 색을 따라간다. 기본값이 음악(보라) 캐릭터라서,
+    // 그대로 두면 음악을 고른 적 없는 사람도 음악 취향처럼 보였다.
+    avatar: mingmingAsset(),
+  };
   globalThis.Storage?.write?.(store);
 
   await safe('syncProfileName', async () => {
     await Cloud.client.from('profiles').update({ display_name: displayName }).eq('id', user.id);
   });
+}
+
+/** 완료한 프로젝트에서 나온 밍밍이 색의 캐릭터 이미지. 없으면 회색이다. */
+function mingmingAsset() {
+  const identity = globalThis.getMingmingColor?.();
+  const name = identity?.score ? identity.category : '기타';
+  const visual = (globalThis.Catalog?.categories || []).find((c) => c.name === name);
+  return visual?.asset || 'assets/category-misc.png';
 }
 
 /** Supabase 오류를 사람이 읽을 수 있는 안내로 바꾼다. */
@@ -1051,14 +1081,43 @@ function attach() {
     };
   }
 
-  // 프로필은 렌더할 때마다 통째로 다시 그려지므로 로그아웃을 다시 잇는다.
+  // 프로필은 렌더할 때마다 통째로 다시 그려지므로 로그아웃을 다시 잇고,
+  // 상수로 박혀 있던 스트릭과 아바타를 실제 값으로 바꿔 준다.
   const baseRenderProfile = globalThis.renderProfile;
   if (typeof baseRenderProfile === 'function') {
     globalThis.renderProfile = (...args) => {
       const result = baseRenderProfile(...args);
       bindLogout();
+      fixProfileFacts();
       return result;
     };
+  }
+
+  /**
+   * 프로필의 '현재 스트릭'은 renderProfile 안에 streak=6 으로 박혀 있어
+   * 아무것도 안 한 계정에도 6일이 떴다. 실제 활동으로 다시 센다.
+   * 아바타도 이전 계정에서 넘어온 값이 아니라 지금 밍밍이 색을 쓴다.
+   */
+  async function fixProfileFacts() {
+    const avatar = document.querySelector('#profile .profile-avatar');
+    if (avatar) avatar.src = mingmingAsset();
+
+    const stats = [...document.querySelectorAll('#profile .profile-stat')];
+    const streakStat = stats.find((s) => s.querySelector('span')?.textContent?.includes('스트릭'));
+    if (!streakStat) return;
+
+    const activity = await MockAPI.getStreakActivity();
+    const days = new Set((activity || []).map((item) => item.date));
+    let count = 0;
+    const cursor = new Date();
+    // 오늘 기록이 없으면 어제까지 이어진 것도 스트릭으로 인정한다.
+    if (!days.has(cursor.toLocaleDateString('sv-SE'))) cursor.setDate(cursor.getDate() - 1);
+    while (days.has(cursor.toLocaleDateString('sv-SE'))) {
+      count += 1;
+      cursor.setDate(cursor.getDate() - 1);
+    }
+    const value = streakStat.querySelector('strong');
+    if (value) value.textContent = `${count}일`;
   }
 
   /* ── C-2 · 조작을 스와이프로 통일 ─────────────────────────────
@@ -1174,10 +1233,13 @@ function attach() {
         startBusyCopyRotation(flow);
       }
 
+      const runCards = currentRunCards();
       const goals = Cloud.ai
         ? await generateGoalsViaAI({
           categories,
-          keywords: Cloud.likedKeywords(),
+          // 이번에 고른 카드만 넘긴다. 과거 좋아요 이력은 넘기지 않는다.
+          keywords: runCards.map((c) => c.title),
+          cards: runCards,
           survey: surveyAnswers(),
         })
         : null;
@@ -1249,7 +1311,9 @@ function attach() {
   /** 선택한 목표마다 할 일을 만들어 localStorage 에 담아 둔다. */
   async function buildTasksFor(picks) {
     const interests = Cloud.interests();
-    const keywords = Cloud.likedKeywords();
+    // 목표와 마찬가지로, 할 일도 이번에 고른 카드에서만 나와야 한다.
+    const runCards = currentRunCards();
+    const keywords = runCards.map((c) => c.title);
 
     // 할 일이 구체적으로 나오려면 재료가 필요하다.
     // 설문 답(쓸 수 있는 시간), 이 목표를 만든 카드의 설명, 실제 남은 일수를 함께 넘긴다.

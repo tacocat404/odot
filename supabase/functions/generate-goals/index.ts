@@ -44,6 +44,7 @@ Deno.serve(async (req: Request) => {
     categories?: string[];
     keywords?: string[];
     survey?: { q?: string; a?: string }[];
+    cards?: { title?: string; category?: string; intro?: string }[];
   };
   try {
     payload = await req.json();
@@ -57,6 +58,24 @@ Deno.serve(async (req: Request) => {
   if (!categories.length) return json({ error: "no_categories" }, 400);
 
   const keywords = cleanInputs(payload.keywords, 30, 15);
+  // 이번 프로젝트를 만드는 카드. 분야별 목표는 그 분야의 카드에서만 나와야 한다.
+  const cards = (payload.cards ?? [])
+    .map((c) => ({
+      title: cleanInput(c?.title, 40),
+      category: CATEGORIES.includes(String(c?.category)) ? String(c.category) : null,
+      intro: cleanInput(c?.intro, 120) ?? "",
+    }))
+    .filter((c): c is { title: string; category: string; intro: string } =>
+      Boolean(c.title && c.category))
+    .slice(0, 12);
+
+  const cardLines = CATEGORIES
+    .map((cat) => {
+      const mine = cards.filter((c) => c.category === cat);
+      if (!mine.length) return "";
+      return `${cat}: ${mine.map((c) => (c.intro ? `${c.title}(${c.intro})` : c.title)).join(", ")}`;
+    })
+    .filter(Boolean);
   // 설문 문항·답도 사용자 입력에서 파생되므로 함께 검사한다.
   const survey = (payload.survey ?? [])
     .map((item) => ({ q: cleanInput(item?.q, 80), a: cleanInput(item?.a, 40) }))
@@ -70,7 +89,9 @@ Deno.serve(async (req: Request) => {
     "규칙:",
     "- 반드시 한국어로 쓴다. 초등학생도 이해할 수 있는 쉬운 문장을 쓴다.",
     "- title 은 목표 한 줄이다. 25자 이내이며 무엇을 언제까지 할지가 드러나야 한다.",
-    "- 사용자가 좋아요한 키워드를 목표 안에 실제로 녹인다. 키워드와 무관한 일반적인 목표를 쓰지 않는다.",
+    "- 분야별 카드가 주어지면, 그 분야의 목표는 반드시 '그 분야의 카드'에서만 만든다.",
+    "- 다른 분야의 카드나 예전에 좋아요한 주제를 끌어와 쓰지 않는다. 이번에 고른 카드가 전부다.",
+    "- 카드 주제를 목표 안에 실제로 녹인다. 카드와 무관한 일반적인 목표를 쓰지 않는다.",
     "",
     "제목이 서로 닮지 않게 하는 규칙(가장 중요):",
     "- 한 분야의 세 후보는 아래 세 형태를 '하나씩' 맡는다. 셋 다 같은 형태면 실패다.",
@@ -88,7 +109,9 @@ Deno.serve(async (req: Request) => {
   ].join("\n");
 
   const user = [
-    keywords.length ? `사용자가 좋아요한 키워드: ${keywords.join(", ")}` : "좋아요한 키워드 없음",
+    cardLines.length
+      ? ["이번 프로젝트를 만드는 카드(분야별):", ...cardLines].join("\n")
+      : (keywords.length ? `사용자가 좋아요한 키워드: ${keywords.join(", ")}` : "좋아요한 키워드 없음"),
     "",
     survey.length ? "설문 답변:" : "",
     ...survey.map((item) => `- ${item.q} → ${item.a}`),
