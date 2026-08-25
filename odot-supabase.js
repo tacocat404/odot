@@ -16,7 +16,6 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
 const SUPABASE_URL = 'https://hqbbynkwxavatfariycj.supabase.co';
 const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_5FIr1LRtmXwGjkJDw9G2Ug_3yqqcKFi';
-const MIGRATION_FLAG = 'odot-cloud-migrated-v1';
 
 // 초기 트렌드 카드 장수, 그리고 항상 확보해 둘 "앞선 카드" 수.
 // 5장으로 시작하고, 2번 카드를 볼 때(current=1, 남은 카드 4장) 6번째를 미리 만든다.
@@ -29,7 +28,6 @@ const Cloud = {
   userId: null,
   online: false,
   ai: true,
-  isAnonymous: true,
   cardIds: new Map(),        // slug -> keyword_cards.id
   keywordBySlug: new Map(),  // slug -> 키워드 문자열
   inFlight: 0,               // 진행 중인 카드 생성 요청 수
@@ -77,29 +75,83 @@ async function safe(label, run, fallback = null) {
 
 /* ────────────────────────────── 부팅 ────────────────────────────── */
 
+/**
+ * 계정이 있어야 앱을 쓴다. 익명 세션은 만들지 않는다.
+ * 로그인 화면은 세션 없이도 떠야 하므로 클라이언트만 먼저 세운다.
+ */
 async function boot() {
-  const client = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+  Cloud.client = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
     auth: { persistSession: true, autoRefreshToken: true, storageKey: 'odot-auth' },
   });
 
-  let { data: { session } } = await client.auth.getSession();
+  const { data: { session } } = await Cloud.client.auth.getSession();
+  if (session?.user) await activateSession(session.user);
+  else console.info('[odot-cloud] 로그인 필요');
+}
 
-  if (!session) {
-    const { data, error } = await client.auth.signInAnonymously();
-    if (error) throw error;
-    session = data.session;
-  }
-  if (!session?.user) throw new Error('세션을 만들지 못했습니다.');
-
-  Cloud.client = client;
-  Cloud.userId = session.user.id;
-  Cloud.isAnonymous = Boolean(session.user.is_anonymous);
+/** 로그인된 사용자로 앱을 켠다. 로그인·회원가입 직후에도 호출한다. */
+async function activateSession(user) {
+  Cloud.userId = user.id;
   Cloud.online = true;
 
   await cacheGlobalCards();
-  await migrateLocalDataOnce();
+  await hydrateFromCloud();
 
   console.info('[odot-cloud] 연결됨 · user', Cloud.userId.slice(0, 8));
+}
+
+/**
+ * 계정이 바뀌면 화면이 읽는 로컬 데이터도 갈아엎는다.
+ * localStorage 가 렌더링의 기준이므로, 지우지 않으면 앞 계정의 카드와
+ * 프로젝트가 새 계정 화면에 그대로 남는다.
+ */
+function resetLocalState() {
+  const store = globalThis.Storage?.read?.() || {};
+  const profile = store.profile;
+  globalThis.Storage?.write?.({ interests: [], reactions: [], projects: [], profile });
+
+  Cloud.keywordBySlug.clear();
+  Cloud.survey = null;
+  Cloud.surveySignature = null;
+  if (globalThis.state) {
+    globalThis.state.interests = [];
+    globalThis.state.deck = [];
+    globalThis.state.current = 0;
+    globalThis.state.decisionLikes = [];
+    globalThis.state.decisionGoalsSelected = [];
+  }
+}
+
+/** 로그인한 계정의 기록을 로컬로 되살린다(다른 기기에서 쓰던 계정 대비). */
+async function hydrateFromCloud() {
+  return safe('hydrateFromCloud', async () => {
+    const [interestRows, reactionRows] = await Promise.all([
+      Cloud.client.from('user_interests').select('name').eq('user_id', Cloud.userId).order('position'),
+      Cloud.client
+        .from('card_reactions')
+        .select('reaction, category, created_at, keyword_cards(slug, title)')
+        .eq('user_id', Cloud.userId)
+        .order('created_at'),
+    ]);
+
+    const store = globalThis.Storage?.read?.() || {};
+    store.interests = (interestRows.data || []).map((r) => r.name);
+    store.reactions = (reactionRows.data || [])
+      .filter((r) => r.keyword_cards?.slug)
+      .map((r) => {
+        // 좋아요한 키워드를 다시 쓸 수 있도록 슬러그 → 키워드 표를 채운다.
+        Cloud.keywordBySlug.set(r.keyword_cards.slug, r.keyword_cards.title);
+        return {
+          topicId: r.keyword_cards.slug,
+          category: r.category,
+          type: r.reaction,
+          at: r.created_at,
+        };
+      });
+    globalThis.Storage?.write?.(store);
+
+    if (globalThis.state) globalThis.state.interests = store.interests;
+  });
 }
 
 /** 전역 시드 카드의 slug → id 매핑을 미리 받아 둔다. */
@@ -158,24 +210,6 @@ function knownCategory(name) {
   return names.includes(name) ? name : '기타';
 }
 
-/* ─────────────────────── localStorage 1회 이관 ─────────────────────── */
-
-async function migrateLocalDataOnce() {
-  if (localStorage.getItem(MIGRATION_FLAG)) return;
-
-  const local = globalThis.Storage?.read?.() || {};
-  await saveInterests(local.interests || []);
-
-  const reactions = (local.reactions || []).filter((r) => r.topicId && r.type);
-  for (const reaction of reactions) {
-    const topic = (globalThis.Catalog?.topics || []).find((t) => t.id === reaction.topicId)
-      || { id: reaction.topicId, category: reaction.category, title: reaction.topicId };
-    await saveReaction(topic, reaction.type);
-  }
-
-  localStorage.setItem(MIGRATION_FLAG, new Date().toISOString());
-  console.info(`[odot-cloud] 기존 기록 이관 완료 · 반응 ${reactions.length}건`);
-}
 
 /* ────────────────────────── 쓰기 (미러) ────────────────────────── */
 
@@ -386,47 +420,40 @@ async function generateGoalsViaAI({ categories, keywords, survey }) {
  * 지금까지 모은 관심 카드·프로젝트·완료 기록이 전부 따라온다.
  */
 async function signUpWithEmail({ email, password, name }) {
-  const { data: { user } } = await Cloud.client.auth.getUser();
-  const upgrading = Boolean(user?.is_anonymous);
+  const { error } = await Cloud.client.auth.signUp({
+    email,
+    password,
+    options: { data: { display_name: name || null } },
+  });
+  if (error) throw error;
 
-  if (upgrading) {
-    const { error } = await Cloud.client.auth.updateUser({
-      email,
-      password,
-      data: { display_name: name || null },
-    });
-    // 확인 메일을 기다리는 중에 같은 값으로 다시 누르면 비밀번호가 이미 설정돼 있어
-    // 거부된다. 가입이 진행 중이라는 뜻이므로 오류가 아니라 대기로 처리한다.
-    if (error && /different from the old password/i.test(error.message || '')) {
-      return { pending: true };
-    }
-    if (error) throw error;
-  } else {
-    const { error } = await Cloud.client.auth.signUp({
-      email,
-      password,
-      options: { data: { display_name: name || null } },
-    });
-    if (error) throw error;
-  }
+  // 이메일 확인이 켜져 있으면 세션이 바로 열리지 않는다. 그대로 넘기면
+  // 가입된 것처럼 보이지만 실제로는 로그인되지 않은 상태다.
+  const { data: { session } } = await Cloud.client.auth.getSession();
+  if (!session?.user?.email) return { pending: true };
 
-  // 프로젝트에서 이메일 확인이 켜져 있으면 이메일이 아직 계정에 붙지 않는다.
-  // 그 상태로 화면을 넘기면 가입된 것처럼 보이지만 실제로는 여전히 익명이다.
-  const { data: { user: after } } = await Cloud.client.auth.getUser();
-  if (!after?.email || after?.is_anonymous) {
-    return { pending: true };
-  }
-
-  await refreshIdentity(name);
-  logEvent('sign_up', { upgraded: upgrading });
+  await adoptSession(session.user, name);
+  logEvent('sign_up', {});
   return { pending: false };
 }
 
 async function signInWithEmail({ email, password }) {
-  const { error } = await Cloud.client.auth.signInWithPassword({ email, password });
+  const { data, error } = await Cloud.client.auth.signInWithPassword({ email, password });
   if (error) throw error;
-  await refreshIdentity();
+  await adoptSession(data.user);
   logEvent('sign_in', {});
+}
+
+/**
+ * 계정을 바꿔 단다.
+ * 계정마다 기록이 따로이므로, 앞 계정의 로컬 데이터를 먼저 비우고
+ * 새 계정의 기록을 내려받는다.
+ */
+async function adoptSession(user, name) {
+  resetLocalState();
+  await activateSession(user);
+  await refreshIdentity(name);
+  Cloud.startDeck?.(); // 새 계정 기준으로 카드를 다시 받는다
 }
 
 /** 세션이 바뀐 뒤 화면이 읽는 로컬 프로필과 DB 프로필을 맞춘다. */
@@ -435,7 +462,6 @@ async function refreshIdentity(name) {
   if (!user) return;
 
   Cloud.userId = user.id;
-  Cloud.isAnonymous = Boolean(user.is_anonymous);
 
   const displayName = name || user.user_metadata?.display_name || (user.email || '').split('@')[0];
   const store = globalThis.Storage?.read?.() || {};
@@ -897,16 +923,11 @@ function attach() {
       .auth-tab.selected{background:#fff;color:var(--ink);box-shadow:0 2px 6px #5a3b7118}
       .auth-help{min-height:18px;margin:8px 0 0;color:#b3352f;font-size:12px;line-height:1.45}
       #loginForm [hidden]{display:none!important}
-      .anon-notice{position:relative;z-index:1;display:flex;flex-direction:column;gap:3px;
-        width:100%;margin-top:14px;padding:12px 14px;border:0;border-radius:15px;
-        background:#ffffffcc;text-align:left;font:inherit;cursor:pointer}
-      .anon-notice strong{font-size:13px}
-      .anon-notice span{color:var(--muted);font-size:11.5px;line-height:1.5}
     `;
     document.head.append(authStyle);
   }
 
-  // 로그아웃: 세션을 비우고 새 익명 세션으로 되돌린다.
+  // 로그아웃: 세션을 끊고 로컬 기록을 비운 뒤 로그인 화면으로 돌아간다.
   // renderProfile 이 프로필 화면을 통째로 다시 그리므로 렌더할 때마다 다시 연결한다.
   function bindLogout() {
     const logoutBtn = document.querySelector('#logout');
@@ -915,43 +936,26 @@ function attach() {
 
     logoutBtn.onclick = async () => {
       await safe('signOut', async () => { await Cloud.client.auth.signOut(); });
-      // 로그아웃해도 앱은 계속 쓸 수 있어야 하므로 익명 세션을 새로 연다.
-      await safe('anonAgain', async () => {
-        const { data } = await Cloud.client.auth.signInAnonymously();
-        if (data?.user) { Cloud.userId = data.user.id; Cloud.isAnonymous = true; }
-      });
+      Cloud.online = false;
+      Cloud.userId = null;
+      // 다음 사람이 같은 기기에서 로그인할 수 있으므로 앞 계정의 기록을 남기지 않는다.
+      resetLocalState();
       const store = Storage.read();
-      store.profile = { ...(store.profile || {}), email: '', name: '밍밍이', signedIn: false };
+      store.profile = { email: '', name: '밍밍이', signedIn: false };
       Storage.write(store);
       globalThis.showScreen?.('login');
       globalThis.toast?.('로그아웃했어요.');
     };
   }
 
-  // 프로필은 렌더할 때마다 통째로 다시 그려진다. 그때마다 로그아웃을 다시 잇고,
-  // 아직 익명이면 기록을 지키라는 안내를 얹는다.
+  // 프로필은 렌더할 때마다 통째로 다시 그려지므로 로그아웃을 다시 잇는다.
   const baseRenderProfile = globalThis.renderProfile;
   if (typeof baseRenderProfile === 'function') {
     globalThis.renderProfile = (...args) => {
       const result = baseRenderProfile(...args);
       bindLogout();
-      showAnonymousNotice();
       return result;
     };
-  }
-
-  /** 익명 상태에서는 기록이 이 기기에만 남는다는 것을 알려 준다. */
-  function showAnonymousNotice() {
-    if (!Cloud.isAnonymous) return;
-    const hero = document.querySelector('#profile .profile-hero');
-    if (!hero || hero.querySelector('.anon-notice')) return;
-    const notice = document.createElement('button');
-    notice.type = 'button';
-    notice.className = 'anon-notice';
-    notice.innerHTML = '<strong>아직 계정이 없어요</strong>'
-      + '<span>가입하면 지금까지 모은 관심 카드가 안전하게 보관돼요.</span>';
-    notice.onclick = () => globalThis.showScreen?.('login');
-    hero.append(notice);
   }
 
   /* ── C-2 · 조작을 스와이프로 통일 ─────────────────────────────
@@ -997,19 +1001,21 @@ function attach() {
     else if (event.key === 'ArrowDown') { event.preventDefault(); globalThis.startDecision?.(); }
   });
 
-  // 첫 진입: 내장 더미 카드를 먼저 보여 주지 않고, 생성 중 상태로 연다.
-  (async () => {
+  /**
+   * 로그인한 계정으로 덱을 새로 채운다.
+   * 카드는 계정별로 다르므로 로그인 전에는 부르지 않고, 계정이 바뀌면 다시 부른다.
+   * 내장 더미 카드를 먼저 비추지 않고 생성 중 상태로 연다.
+   */
+  async function initDeck() {
     const state = globalThis.state;
     const card = document.querySelector('#activeCard');
-    if (!state || !card) return;
+    if (!state || !card || !Cloud.online) return;
 
-    if (Cloud.ai) {
-      state.deck = [];
-      state.current = 0;
-      card.dataset.color = 'gray';
-      card.innerHTML = busyCardHTML('오늘의 키워드를 고르는 중');
-      startBusyCopyRotation(card);
-    }
+    state.deck = [];
+    state.current = 0;
+    card.dataset.color = 'gray';
+    card.innerHTML = busyCardHTML('오늘의 키워드를 고르는 중');
+    startBusyCopyRotation(card);
 
     const cards = await fetchKeywordCards(INITIAL_CARDS);
     if (!cards.length) {
@@ -1023,7 +1029,11 @@ function attach() {
     state.deck = cards;
     state.current = 0;
     globalThis.renderDeck?.();
-  })();
+  }
+
+  // 로그인 이후(부팅 시 세션 복원 포함)에 세션이 잡히면 덱을 채운다.
+  Cloud.startDeck = initDeck;
+  if (Cloud.online) initDeck();
 
   // ── 실제 제작 흐름: 설문 → 목표 후보 → 프로젝트 ──────────────────
   // 프로토타입은 목표 후보(decisionGoals)와 할 일(Catalog.projects)을 모두
@@ -1290,10 +1300,12 @@ function attach() {
 
 /* ────────────────────────── 시작 ────────────────────────── */
 
+// 로그인 화면은 세션이 없어도, 심지어 부팅이 실패해도 떠야 한다.
+// 그래서 attach 는 boot 의 성패와 무관하게 항상 실행한다.
 boot()
-  .then(attach)
   .catch((err) => {
     console.warn('[odot-cloud] 오프라인 모드로 동작합니다:', err?.message || err);
-  });
+  })
+  .finally(attach);
 
 globalThis.OdotCloud = Cloud;
