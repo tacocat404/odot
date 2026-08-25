@@ -1,0 +1,182 @@
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+
+// F-OVNIBD · 실시간 트렌드 기반 "키워드" 카드 생성
+//
+// 카드에 적히는 것은 할 일이 아니라 키워드다(수학, 과학, 국어, 체육, 미술 …).
+// 사용자가 좋아요한 키워드들을 조합해 나중에 to-do 를 만든다.
+//
+// 트렌드 소스: Google Trends 일간 인기 검색어 RSS (한국, 인증 불필요, 실시간).
+// 원본 트렌드는 인물/연예 뉴스가 많으므로, LLM 이 이를 "배울 수 있는 키워드"로 옮긴다.
+//   예) 장원영 → K팝 보컬(음악)
+// 트렌드 호출이 실패하면 관심사 기반 키워드 생성으로 조용히 대체한다.
+
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+const CATEGORIES = ["운동", "공부", "독서", "음악", "교양", "진로", "기타"];
+
+// 대회용 서비스 계정 키가 접근 가능한 유일한 모델.
+// 이 모델은 커스텀 temperature 를 지원하지 않는다(기본값 1만 허용).
+const DEFAULT_MODEL = "gpt-5.6-luna";
+
+const TRENDS_RSS = "https://trends.google.com/trending/rss?geo=KR";
+
+function json(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...CORS, "Content-Type": "application/json" },
+  });
+}
+
+function slugify(seed: string, index: number) {
+  const hash = Array.from(seed).reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7);
+  return `kw-${hash.toString(36)}-${index}`;
+}
+
+/** Google Trends RSS 에서 인기 검색어만 뽑아 온다. 실패는 빈 배열로 흡수한다. */
+async function fetchTrends(): Promise<string[]> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
+    const res = await fetch(TRENDS_RSS, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return [];
+
+    const xml = await res.text();
+    const items = xml.match(/<item>[\s\S]*?<\/item>/g) ?? [];
+    return items
+      .map((item) => item.match(/<title>([\s\S]*?)<\/title>/)?.[1] ?? "")
+      .map((t) => t.replace(/<!\[CDATA\[|\]\]>/g, "").trim())
+      .filter(Boolean)
+      .slice(0, 20);
+  } catch (err) {
+    console.warn("trends_unreachable", String(err));
+    return [];
+  }
+}
+
+Deno.serve(async (req: Request) => {
+  if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
+  if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+
+  const apiKey = Deno.env.get("OPENAI_API_KEY");
+  if (!apiKey) return json({ error: "missing_openai_key" }, 503);
+
+  let payload: {
+    interests?: string[];
+    likedKeywords?: string[];
+    seenKeywords?: string[];
+    count?: number;
+  };
+  try {
+    payload = await req.json();
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  const interests = (payload.interests ?? []).slice(0, 5);
+  const liked = (payload.likedKeywords ?? []).slice(0, 15);
+  const seen = (payload.seenKeywords ?? []).slice(0, 40);
+  const count = Math.min(Math.max(payload.count ?? 5, 1), 8);
+
+  const trends = await fetchTrends();
+
+  const system = [
+    "너는 ODOT의 키워드 카드 추천기다.",
+    "한국의 중·고·대학생과 취업준비생에게 '배우거나 해볼 만한 주제'를 키워드 형태로 보여 준다.",
+    "",
+    "가장 중요한 규칙:",
+    "- keyword 는 할 일 문장이 아니라 '명사 키워드'다. 예: 수학, 물리, 한국사, 클래식 기타, 사진 구도, 면접 스피치.",
+    "- keyword 는 2~10자 사이의 짧은 한국어 명사구다. 문장이나 동사로 끝내지 않는다.",
+    "- '~하기', '~해보기', '~읽기' 같은 할 일 표현은 절대 쓰지 않는다.",
+    "",
+    "그 밖의 규칙:",
+    "- 반드시 한국어로 쓴다.",
+    `- category 는 반드시 다음 중 하나다: ${CATEGORIES.join(", ")}`,
+    "- intro 는 그 키워드가 무엇인지 한 문장(30자 이내)으로 설명한다.",
+    "- easy 는 초등학생도 이해할 수 있는 1~2문장 설명이다.",
+    "- reason 은 추천 근거를 짧게 쓴다. 트렌드에서 왔으면 '실시간 트렌드 · <원본 검색어>' 형식으로 쓴다.",
+    "- 미성년자가 쓴다. 위험한 활동, 의료·투자 조언, 음주·흡연, 성인 주제, 무리한 다이어트, 특정 인물 비방은 절대 넣지 않는다.",
+    "- 실존 인물 이름 자체를 keyword 로 쓰지 않는다. 그 인물과 연결되는 '배울 수 있는 분야'로 바꾼다. 예: 축구 선수 → 축구 전술.",
+  ].join("\n");
+
+  const user = [
+    trends.length
+      ? `지금 한국에서 실시간으로 많이 검색되는 말: ${trends.join(", ")}`
+      : "실시간 트렌드를 가져오지 못했다. 관심 분야만 참고한다.",
+    interests.length ? `사용자가 고른 관심 분야: ${interests.join(", ")}` : "",
+    liked.length ? `사용자가 좋아요한 키워드: ${liked.join(", ")}` : "",
+    seen.length ? `이미 보여 준 키워드(중복 금지): ${seen.join(", ")}` : "",
+    "",
+    `서로 다른 키워드 카드 ${count}개를 만든다.`,
+    trends.length
+      ? "가능하면 절반 이상은 위 실시간 검색어에서 출발해, 학생이 배울 수 있는 분야 키워드로 바꿔 만든다."
+      : "",
+    interests.length ? "나머지는 사용자의 관심 분야에서 고른다." : "",
+    "다음 JSON 형태로만 답한다:",
+    '{"cards":[{"keyword":"한국사","category":"공부","intro":"우리나라의 지난 이야기를 다루는 과목.","reason":"실시간 트렌드 · 광복절","easy":"옛날에 우리나라에서 있었던 일을 배우는 거예요."}]}',
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  let raw: string;
+  try {
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: Deno.env.get("OPENAI_MODEL") ?? DEFAULT_MODEL,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+      }),
+    });
+
+    if (!res.ok) {
+      const detail = await res.text();
+      console.error("openai_error", res.status, detail.slice(0, 500));
+      return json({ error: "upstream_failed", status: res.status }, 502);
+    }
+
+    const data = await res.json();
+    raw = data?.choices?.[0]?.message?.content ?? "";
+  } catch (err) {
+    console.error("fetch_failed", err);
+    return json({ error: "upstream_unreachable" }, 502);
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return json({ error: "unparsable_response" }, 502);
+  }
+
+  const list = Array.isArray(parsed.cards) ? parsed.cards : [];
+  const cards = list
+    .map((c: Record<string, unknown>, i: number) => {
+      const keyword = String(c?.keyword ?? "").trim().slice(0, 20);
+      if (!keyword) return null;
+      const category = CATEGORIES.includes(String(c?.category)) ? String(c.category) : "기타";
+      return {
+        slug: slugify(keyword, i),
+        keyword,
+        category,
+        intro: String(c?.intro ?? "").slice(0, 120),
+        reason: String(c?.reason ?? `새로운 추천 · ${category}`).slice(0, 60),
+        easy: String(c?.easy ?? "").slice(0, 300),
+      };
+    })
+    .filter(Boolean);
+
+  if (!cards.length) return json({ error: "empty_cards" }, 502);
+  return json({ cards, trendCount: trends.length });
+});

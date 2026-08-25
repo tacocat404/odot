@@ -18,12 +18,32 @@ const SUPABASE_URL = 'https://hqbbynkwxavatfariycj.supabase.co';
 const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_5FIr1LRtmXwGjkJDw9G2Ug_3yqqcKFi';
 const MIGRATION_FLAG = 'odot-cloud-migrated-v1';
 
+// 초기 트렌드 카드 장수, 그리고 항상 확보해 둘 "앞선 카드" 수.
+// 5장으로 시작하고, 2번 카드를 볼 때(current=1, 남은 카드 4장) 6번째를 미리 만든다.
+const INITIAL_CARDS = 5;
+const BUFFER_AHEAD = 4;
+
 const Cloud = {
   client: null,
   userId: null,
   online: false,
   ai: true,
-  cardIds: new Map(), // slug -> keyword_cards.id
+  cardIds: new Map(),        // slug -> keyword_cards.id
+  keywordBySlug: new Map(),  // slug -> 키워드 문자열
+  prefetching: false,
+
+  interests() {
+    return globalThis.Storage?.read?.()?.interests || [];
+  },
+  /** 좋아요한 카드의 키워드 목록 (to-do 생성의 재료) */
+  likedKeywords() {
+    const reactions = globalThis.Storage?.read?.()?.reactions || [];
+    return reactions
+      .filter((r) => r.type === 'like')
+      .map((r) => Cloud.keywordBySlug.get(r.topicId)
+        || globalThis.Catalog?.topics?.find((t) => t.id === r.topicId)?.title?.replace('\n', ' '))
+      .filter(Boolean);
+  },
 };
 
 /** Supabase 호출을 감싸 실패를 삼킨다. UI 흐름은 절대 막지 않는다. */
@@ -100,7 +120,7 @@ async function ensureCard(topic) {
       user_id: Cloud.userId,
       slug,
       category: knownCategory(topic.category),
-      title: topic.title || slug,
+      title: topic.keyword || topic.title || Cloud.keywordBySlug.get(slug) || slug,
       intro: topic.intro || '',
       reason: topic.reason || '',
       easy: topic.easy || topic.intro || '',
@@ -256,21 +276,37 @@ async function generateProjectViaAI({ category, duration, interests, likedTitles
   return data;
 }
 
-/** F-OVNIBD · 카드 소진 시 AI 로 보충 */
-async function recommendCardsViaAI({ interests, likedCategories, seenTitles, count }) {
-  const data = await invoke('recommend-cards', { interests, likedCategories, seenTitles, count });
+/**
+ * F-OVNIBD · 실시간 트렌드 기반 "키워드" 카드
+ *
+ * 카드에 적히는 것은 할 일이 아니라 키워드다(수학, 과학, 국어, 체육, 미술 …).
+ * 좋아요한 키워드가 모여 나중에 to-do 를 만드는 재료가 된다.
+ */
+async function fetchKeywordCards(count) {
+  const data = await invoke('trend-keywords', {
+    interests: Cloud.interests(),
+    likedKeywords: Cloud.likedKeywords(),
+    seenKeywords: [...Cloud.keywordBySlug.values()].slice(-40),
+    count,
+  });
   if (!data?.cards?.length) return [];
 
   const palette = new Map((globalThis.Catalog?.categories || []).map((c) => [c.name, c.color]));
-  return data.cards.map((card) => ({
-    id: card.slug,
-    category: knownCategory(card.category),
-    color: palette.get(knownCategory(card.category)) || 'gray',
-    title: card.title,
-    intro: card.intro,
-    reason: card.reason,
-    easy: card.easy,
-  }));
+  return data.cards.map((card) => {
+    const category = knownCategory(card.category);
+    Cloud.keywordBySlug.set(card.slug, card.keyword);
+    return {
+      id: card.slug,
+      isKeyword: true,
+      keyword: card.keyword,
+      category,
+      color: palette.get(category) || 'gray',
+      title: card.keyword, // 기존 렌더링과 호환되도록 title 에도 키워드를 넣는다
+      intro: card.intro,
+      reason: card.reason,
+      easy: card.easy,
+    };
+  });
 }
 
 /* ────────────────────────── 기존 코드에 연결 ────────────────────────── */
@@ -281,16 +317,13 @@ function attach() {
   const Catalog = globalThis.Catalog;
   if (!MockAPI || !Storage) return;
 
-  const likedContext = () => {
-    const data = Storage.read();
-    const likes = (data.reactions || []).filter((r) => r.type === 'like');
-    const titleOf = (id) => Catalog?.topics?.find((t) => t.id === id)?.title?.replace('\n', ' ');
-    return {
-      interests: data.interests || [],
-      likedCategories: likes.map((r) => r.category),
-      likedTitles: likes.map((r) => titleOf(r.topicId)).filter(Boolean),
-    };
-  };
+  const likedContext = () => ({
+    interests: Cloud.interests(),
+    likedCategories: (Storage.read().reactions || [])
+      .filter((r) => r.type === 'like')
+      .map((r) => r.category),
+    likedTitles: Cloud.likedKeywords(),
+  });
 
   // 관심사 저장 미러
   const baseSaveInterests = MockAPI.saveInterests.bind(MockAPI);
@@ -301,30 +334,95 @@ function attach() {
   };
 
   // 카드 반응 미러
+  // 현재 덱을 먼저 뒤진다. 트렌드 키워드 카드는 Catalog 에 없으므로
+  // 덱을 건너뛰면 제목 없는 껍데기가 넘어가 DB 에 슬러그가 제목으로 저장된다.
   const baseSaveReaction = MockAPI.saveReaction.bind(MockAPI);
   MockAPI.saveReaction = async (reaction) => {
     const result = await baseSaveReaction(reaction);
-    const topic = Catalog?.topics?.find((t) => t.id === reaction.topicId)
+    const topic = globalThis.state?.deck?.find((c) => c.id === reaction.topicId)
+      || Catalog?.topics?.find((t) => t.id === reaction.topicId)
       || { id: reaction.topicId, category: reaction.category };
     saveReaction(topic, reaction.type);
     return result;
   };
 
-  // 카드 덱 보충: 로컬 카드를 다 보면 AI 카드를 이어 붙인다
+  // ── 덱: 실시간 트렌드 키워드 카드로 교체 ──────────────────────────
+  // 내장 카드는 AI 가 응답하기 전까지만 보여 주는 자리 표시자로 남는다.
   const baseGetRecommendations = MockAPI.getRecommendations.bind(MockAPI);
   MockAPI.getRecommendations = async () => {
-    const local = await baseGetRecommendations();
-    if (local.length >= 4) return local;
-
-    const ctx = likedContext();
-    const fresh = await recommendCardsViaAI({
-      interests: ctx.interests,
-      likedCategories: ctx.likedCategories,
-      seenTitles: local.map((t) => t.title?.replace('\n', ' ')),
-      count: 5,
-    });
-    return fresh.length ? [...local, ...fresh] : local;
+    const cards = await fetchKeywordCards(INITIAL_CARDS);
+    return cards.length ? cards : baseGetRecommendations();
   };
+
+  /**
+   * 선버퍼링: 사용자가 카드를 넘기기 "전에" 다음 카드를 만들어 둔다.
+   * 5장으로 시작해 2번 카드를 볼 때 6번째를 만들고, 이후로도 항상 4장을 앞서 확보한다.
+   * → 카드가 넘어가는 순간 생성이 시작되지 않으므로 로딩 대기가 사라진다.
+   */
+  async function prefetchAhead() {
+    const state = globalThis.state;
+    if (!state || Cloud.prefetching || !Cloud.ai) return;
+    if (!state.deck?.[state.current]?.isKeyword) return; // 아직 자리 표시자 덱이면 건너뛴다
+    if (state.deck.length - state.current > BUFFER_AHEAD) return;
+
+    Cloud.prefetching = true;
+    try {
+      const fresh = await fetchKeywordCards(1);
+      if (fresh.length) {
+        state.deck.push(...fresh);
+        globalThis.renderDeck?.(); // 뒤에 쌓인 카드 미리보기를 갱신
+      }
+    } finally {
+      Cloud.prefetching = false;
+    }
+  }
+
+  // 카드를 넘길 때마다 버퍼를 채운다(응답을 기다리지 않는다).
+  const baseReact = globalThis.react;
+  if (typeof baseReact === 'function') {
+    globalThis.react = async (type) => {
+      await baseReact(type);
+      prefetchAhead();
+    };
+  }
+
+  // 키워드 카드는 "할 일"이 아니라 키워드가 주인공이므로 다르게 그린다.
+  const baseCardHTML = globalThis.cardHTML;
+  if (typeof baseCardHTML === 'function') {
+    globalThis.cardHTML = (t) => {
+      if (!t?.isKeyword) return baseCardHTML(t);
+      const visual = (Catalog?.categories || []).find((c) => c.name === t.category)
+        || (Catalog?.categories || []).at(-1);
+      return `<span class="swipe-stamp pass" aria-hidden="true">PASS</span>`
+        + `<span class="swipe-stamp like" aria-hidden="true">GOOD</span>`
+        + `<span class="topic-tag">${t.category}</span>`
+        + `<div class="kw-block"><p class="kw-label">키워드</p>`
+        + `<h2 class="kw-word">${t.keyword}</h2>`
+        + `<p class="sub">${t.intro}</p></div>`
+        + `<p class="reason">${t.reason}</p>`
+        + `<img class="topic-mascot" src="${visual.asset}" alt="${t.category} 캐릭터">`;
+    };
+  }
+
+  const keywordStyle = document.createElement('style');
+  keywordStyle.textContent = `
+    .kw-block{display:flex;flex-direction:column;gap:6px;margin:6px 0 2px}
+    .kw-label{margin:0;color:var(--muted);font-size:11px;font-weight:900;letter-spacing:.14em}
+    .kw-word{margin:0;font-size:40px;line-height:1.08;letter-spacing:-1.6px;word-break:keep-all}
+    @media (max-width:380px){.kw-word{font-size:33px}}
+  `;
+  document.head.append(keywordStyle);
+
+  // 첫 진입: 트렌드 키워드 덱을 받아 자리 표시자를 교체한다.
+  (async () => {
+    const state = globalThis.state;
+    const cards = await fetchKeywordCards(INITIAL_CARDS);
+    if (!cards.length || !state) return;
+    if (state.current > 0) return; // 이미 넘기기 시작했으면 흐름을 끊지 않는다
+    state.deck = cards;
+    state.current = 0;
+    globalThis.renderDeck?.();
+  })();
 
   // 프로젝트 생성: AI 우선, 실패하면 기존 목업
   const baseCreateProject = MockAPI.createProject.bind(MockAPI);
