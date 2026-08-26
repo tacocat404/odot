@@ -2661,7 +2661,7 @@ function attach() {
     clearTimeout(insightRefreshTimer);
     insightRefreshTimer = setTimeout(() => {
       if (document.querySelector('#review')?.classList.contains('active')) {
-        renderLiveInsights().catch((error) => console.warn('[odot-cloud] insight refresh', error.message));
+        queueLiveInsightRender();
       }
     }, 120);
   }
@@ -2683,6 +2683,44 @@ function attach() {
       if (root) root.innerHTML = '<p class="eyebrow">내 인사이트</p><h1>기록을 불러오지<br>못했어요.</h1><div class="empty">잠시 뒤 다시 열어 주세요.</div>';
     }
   };
+
+  /*
+   * prototype.html은 같은 renderReview를 여러 번 감싸서 전역 프로퍼티만
+   * 바꿔서는 마지막 더미 렌더가 남을 수 있다. 화면 콘텐츠 변경을 감지해
+   * 실제 DB 인사이트로 한 번 더 교체한다. 우리 렌더로 인한 변경은 잠시
+   * 무시해 무한 렌더를 막는다.
+   */
+  let replacingInsight = false;
+  let insightRenderTimer;
+  function queueLiveInsightRender() {
+    clearTimeout(insightRenderTimer);
+    insightRenderTimer = setTimeout(async () => {
+      if (replacingInsight || !document.querySelector('#review')?.classList.contains('active')) return;
+      replacingInsight = true;
+      try {
+        await renderLiveInsights();
+      } catch (error) {
+        console.warn('[odot-cloud] insight render', error.message);
+      } finally {
+        // MutationObserver 콜백은 같은 작업의 microtask에서 실행된다.
+        setTimeout(() => { replacingInsight = false; }, 0);
+      }
+    }, 0);
+  }
+
+  const insightRoot = document.querySelector('#reviewContent');
+  if (insightRoot) {
+    new MutationObserver(() => {
+      if (!replacingInsight && document.querySelector('#review')?.classList.contains('active')) {
+        queueLiveInsightRender();
+      }
+    }).observe(insightRoot, { childList: true, subtree: true });
+  }
+  document.querySelectorAll('.nav[data-target="review"]').forEach((button) => {
+    // 캡처 단계에서 예약해 기존 onclick/async 렌더가 끝난 뒤에도 실제 값을 보장한다.
+    button.addEventListener('click', queueLiveInsightRender, true);
+  });
+  if (document.querySelector('#review')?.classList.contains('active')) queueLiveInsightRender();
   // 화면 폭이 바뀌면 타일 높이도 바뀌므로 다시 맞춘다.
   window.addEventListener('resize', () => {
     if (document.querySelector('#review')?.classList.contains('active')) scaleShareNumbers();
