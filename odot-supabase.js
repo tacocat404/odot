@@ -1163,7 +1163,9 @@ function attach() {
     const topic = globalThis.state?.deck?.find((c) => c.id === reaction.topicId)
       || Catalog?.topics?.find((t) => t.id === reaction.topicId)
       || { id: reaction.topicId, category: reaction.category };
-    saveReaction(topic, reaction.type);
+    // DB 반영이 끝난 뒤 열린 인사이트를 다시 읽는다. 화면의 로컬 반응만 보고
+    // 가짜 증가분을 더하지 않아 다른 기기에서도 같은 수치가 보인다.
+    void saveReaction(topic, reaction.type).finally(() => refreshLiveInsights());
     return result;
   };
 
@@ -2313,7 +2315,8 @@ function attach() {
         check.dataset.cloudBound = 'true';
         // 프로토타입의 onclick 이 먼저 클래스를 토글한 뒤 이 리스너가 결과를 읽는다.
         check.addEventListener('click', () => {
-          markTaskCompletion(key, index, task.classList.contains('completed'));
+          void markTaskCompletion(key, index, task.classList.contains('completed'))
+            .finally(() => refreshLiveInsights());
         });
       });
     });
@@ -2468,12 +2471,12 @@ function attach() {
   if (typeof baseSaveTaskNote === 'function') {
     globalThis.saveTaskNote = (entry) => {
       const result = baseSaveTaskNote(entry);
-      persistTaskNote({
+      void persistTaskNote({
         projectKey: entry?.project,
         index: entry?.task,
         note: entry?.note,
         date: entry?.date,
-      });
+      }).finally(() => refreshLiveInsights());
       return result;
     };
   }
@@ -2550,16 +2553,136 @@ function attach() {
     });
   }
 
-  // 인사이트 화면이 그려진 뒤 주간 막대와 비중 숫자를 바로잡는다.
-  const baseRenderReviewForWeek = globalThis.renderReview;
-  if (typeof baseRenderReviewForWeek === 'function') {
-    globalThis.renderReview = async (...args) => {
-      const result = await baseRenderReviewForWeek(...args);
-      await renderWeeklyBars();
-      scaleShareNumbers();
-      return result;
+  /** 인사이트를 데모 값 없이 로그인한 계정의 DB 기록만으로 그린다. */
+  const insightDate = (date) => date.toLocaleDateString('sv-SE');
+  const insightLabel = (date) => new Intl.DateTimeFormat('ko-KR', {
+    year: 'numeric', month: 'long', day: 'numeric',
+  }).format(date);
+
+  async function renderLiveInsights() {
+    const root = document.querySelector('#reviewContent');
+    if (!root) return;
+    if (!Cloud.online || !Cloud.userId) {
+      root.innerHTML = '<p class="eyebrow">내 인사이트</p><h1>계정 기록을<br>불러오는 중이에요.</h1>';
+      return;
+    }
+
+    const today = new Date();
+    const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
+    const mapStart = new Date(today);
+    mapStart.setDate(today.getDate() - 27);
+    mapStart.setHours(0, 0, 0, 0);
+
+    const [reactionResult, completionResult] = await Promise.all([
+      Cloud.client.from('card_reactions')
+        .select('category, created_at')
+        .eq('user_id', Cloud.userId)
+        .eq('reaction', 'like')
+        .gte('created_at', monthStart.toISOString()),
+      Cloud.client.from('daily_category_summary')
+        .select('day, category, completed_count')
+        .eq('user_id', Cloud.userId)
+        .gte('day', insightDate(monthStart)),
+    ]);
+    if (reactionResult.error) throw reactionResult.error;
+    if (completionResult.error) throw completionResult.error;
+
+    const reactions = reactionResult.data || [];
+    const completions = completionResult.data || [];
+    const monthLikes = reactions.filter((row) => new Date(row.created_at) >= monthStart);
+    const ranks = new Map();
+    monthLikes.forEach((row) => {
+      const category = knownCategory(row.category);
+      ranks.set(category, (ranks.get(category) || 0) + 1);
+    });
+    const ranked = [...ranks.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([category, count]) => ({ category, count }));
+
+    const byDay = new Map();
+    const addDay = (date, category, amount) => {
+      if (!date || !amount) return;
+      const key = String(date).slice(0, 10);
+      const entry = byDay.get(key) || { likes: 0, completed: 0, category: '기타' };
+      if (category) entry.category = knownCategory(category);
+      if (amount.likes) entry.likes += amount.likes;
+      if (amount.completed) entry.completed += amount.completed;
+      byDay.set(key, entry);
     };
+    reactions.forEach((row) => addDay(new Date(row.created_at).toLocaleDateString('sv-SE'), row.category, { likes: 1 }));
+    completions.forEach((row) => addDay(row.day, row.category, { completed: Number(row.completed_count) || 0 }));
+
+    if (!ranked.length && !completions.length) {
+      root.innerHTML = `<p class="eyebrow">${today.getFullYear()}년 ${today.getMonth() + 1}월 · 내 인사이트</p>`
+        + '<h1>아직 모인 기록이<br>없어요.</h1><div class="empty"><strong>더미 데이터는 보여 주지 않아요.</strong><p>발견에서 카드를 고르거나 프로젝트의 첫 행동을 완료하면 이곳에 실제 기록이 쌓여요.</p></div>';
+      return;
+    }
+
+    const lead = ranked[0] || { category: knownCategory(completions[0]?.category), count: 0 };
+    const leadVisual = (Catalog.categories || []).find((item) => item.name === lead.category)
+      || (Catalog.categories || []).at(-1);
+    const totalLikes = ranked.reduce((sum, item) => sum + item.count, 0);
+    const mapDays = Array.from({ length: 28 }, (_, index) => {
+      const date = new Date(mapStart);
+      date.setDate(mapStart.getDate() + index);
+      return insightDate(date);
+    });
+    const weekDays = thisWeekDays();
+    const maxWeek = Math.max(1, ...weekDays.map((date) => {
+      const item = byDay.get(date);
+      return (item?.likes || 0) + (item?.completed || 0);
+    }));
+    const weekLabels = ['월', '화', '수', '목', '금', '토', '일'];
+
+    root.innerHTML = `<p class="eyebrow">${today.getFullYear()}년 ${today.getMonth() + 1}월 · 내 인사이트</p>`
+      + '<h1>이번 달의 나는<br>무엇에 끌렸을까?</h1>'
+      + `<div class="review-card" style="background:color-mix(in srgb,var(--${leadVisual.color}) 21%,#fff)"><p class="eyebrow">이번 달 가장 큰 관심</p><h2>${lead.category} 탐색</h2><p class="sub">카드 ${totalLikes}장을 직접 골랐어요.</p><img class="review-mascot" src="${leadVisual.asset}" alt="${lead.category} 캐릭터"></div>`
+      + `<section class="insight-section" aria-label="실시간 관심과 실행 기록"><h2 class="insight-title">관심의 비중</h2><div class="stats-bento">${ranked.map((item) => {
+        const visual = (Catalog.categories || []).find((category) => category.name === item.category) || leadVisual;
+        const percent = Math.round((item.count / Math.max(totalLikes, 1)) * 100);
+        return `<article class="stat-tile" style="--tile-wash:color-mix(in srgb,var(--${visual.color}) 25%,white)"><span class="stat-name">${item.category}</span><strong>${percent}%</strong></article>`;
+      }).join('')}</div>`
+      + `<div class="chart-card" style="--heat:var(--${leadVisual.color})"><h3>최근 4주 활동 맵</h3><p>카드를 고르거나 할 일을 완료한 날이에요.</p><div class="heatmap" aria-label="최근 4주 실제 활동 맵">${mapDays.map((date) => {
+        const item = byDay.get(date);
+        const amount = (item?.likes || 0) + (item?.completed || 0);
+        return `<i data-level="${Math.min(amount, 4)}" title="${date}: ${amount}건" aria-label="${date}: ${amount}건"></i>`;
+      }).join('')}</div><div class="chart-legend"><span>적게</span><i></i><span>많이</span></div></div>`
+      + `<div class="chart-card" style="--heat:var(--${leadVisual.color})"><h3>이번 주 활동</h3><p>카드 선택과 완료 행동을 합쳐 보여 줘요.</p><div class="weekly-bars">${weekDays.map((date, index) => {
+        const item = byDay.get(date);
+        const amount = (item?.likes || 0) + (item?.completed || 0);
+        return `<div class="weekly-bar ${amount === maxWeek && amount > 0 ? 'active' : ''}"><b>${amount}</b><i style="height:${(amount / maxWeek) * 86}%"></i><span>${weekLabels[index]}</span></div>`;
+      }).join('')}</div></div></section>`;
+    scaleShareNumbers();
   }
+
+  let insightRefreshTimer;
+  function refreshLiveInsights() {
+    clearTimeout(insightRefreshTimer);
+    insightRefreshTimer = setTimeout(() => {
+      if (document.querySelector('#review')?.classList.contains('active')) {
+        renderLiveInsights().catch((error) => console.warn('[odot-cloud] insight refresh', error.message));
+      }
+    }, 120);
+  }
+
+  // 같은 계정에서 다른 기기/탭으로 기록이 바뀌어도 인사이트가 즉시 따라온다.
+  if (Cloud.online && Cloud.userId) {
+    Cloud.client.channel(`odot-insights-${Cloud.userId}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'card_reactions', filter: `user_id=eq.${Cloud.userId}` }, refreshLiveInsights)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'daily_category_summary', filter: `user_id=eq.${Cloud.userId}` }, refreshLiveInsights)
+      .subscribe();
+  }
+
+  globalThis.renderReview = async () => {
+    try {
+      await renderLiveInsights();
+    } catch (error) {
+      console.warn('[odot-cloud] render insights', error.message);
+      const root = document.querySelector('#reviewContent');
+      if (root) root.innerHTML = '<p class="eyebrow">내 인사이트</p><h1>기록을 불러오지<br>못했어요.</h1><div class="empty">잠시 뒤 다시 열어 주세요.</div>';
+    }
+  };
   // 화면 폭이 바뀌면 타일 높이도 바뀌므로 다시 맞춘다.
   window.addEventListener('resize', () => {
     if (document.querySelector('#review')?.classList.contains('active')) scaleShareNumbers();
