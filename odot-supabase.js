@@ -944,8 +944,22 @@ function installBusyStyles() {
       color:var(--muted);font-size:11px;font-weight:800}
     .odot-buffer-hint:before{content:"";width:6px;height:6px;border-radius:50%;
       background:var(--primary,#7152a6);animation:odotBusyPulse 1.25s ease-in-out infinite}
+    .interest-ai-panel{margin:14px 0 4px;padding:13px 14px;border:1px solid #e7def4;border-radius:17px;background:#faf7ff;box-shadow:0 6px 14px #5937890b}
+    .interest-ai-panel[hidden]{display:none}
+    .interest-ai-heading{display:flex;align-items:center;gap:9px}
+    .interest-ai-heading>i{width:11px;height:11px;flex:0 0 11px;border-radius:50%;background:var(--primary,#7152a6);box-shadow:0 0 0 5px #ede4fb;animation:odotBusyPulse 1.25s ease-in-out infinite}
+    .interest-ai-heading strong{display:block;font-size:12px;letter-spacing:-.2px}
+    .interest-ai-heading .odot-busy-detail{margin-top:3px;font-size:11px;line-height:1.45}
+    .interest-ai-panel .odot-agent-live{justify-content:flex-start;margin:10px 0 7px;font-size:10.5px}
+    .interest-ai-panel .odot-agent-progress{width:100%;margin:0;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px}
+    .interest-ai-panel .odot-agent-progress li{min-width:0;gap:4px;font-size:9.5px;line-height:1.3}
+    .interest-ai-panel .odot-agent-progress li span{width:16px;height:16px;flex:0 0 16px;font-size:9px}
+    .interest-ai-ready{display:flex;align-items:flex-start;gap:9px}
+    .interest-ai-ready>i{display:grid;place-items:center;width:22px;height:22px;flex:0 0 22px;border-radius:50%;background:#e5f3eb;color:#2f7b59;font-size:12px;font-style:normal;font-weight:900}
+    .interest-ai-ready strong{display:block;font-size:12px;letter-spacing:-.2px}
+    .interest-ai-ready p{margin:3px 0 0;color:var(--muted);font-size:11px;line-height:1.45}
     @media (prefers-reduced-motion:reduce){
-      .odot-busy-dot,.odot-buffer-hint:before{animation:none}
+      .odot-busy-dot,.odot-buffer-hint:before,.interest-ai-heading>i{animation:none}
     }
   `;
   document.head.append(style);
@@ -1040,14 +1054,18 @@ document.head.append(taskPlanStyle);
  * 카드에 적히는 것은 할 일이 아니라 키워드다(수학, 과학, 국어, 체육, 미술 …).
  * 좋아요한 키워드가 모여 나중에 to-do 를 만드는 재료가 된다.
  */
-async function fetchKeywordCards(count) {
+async function fetchKeywordCards(count, options = {}) {
+  const selectedInterests = Array.isArray(options.interests)
+    ? options.interests
+    : Cloud.interests();
+  const knownCategories = new Set((globalThis.Catalog?.categories || []).map((item) => item.name));
   const data = await invoke('trend-keywords', {
-    interests: Cloud.interests(),
+    interests: selectedInterests,
     likedKeywords: Cloud.likedKeywords(),
     seenKeywords: [...Cloud.keywordBySlug.values()].slice(-40),
     doneProjects: Cloud.doneProjects(),
     savedCards: Cloud.savedCards(),
-    customInterests: Cloud.customInterests(),
+    customInterests: selectedInterests.filter((name) => !knownCategories.has(name)),
     count,
   });
   if (!data?.cards?.length) return [];
@@ -1181,6 +1199,100 @@ function attach() {
   MockAPI.getRecommendations = async () => {
     const cards = await fetchKeywordCards(INITIAL_CARDS);
     return cards.length ? cards : baseGetRecommendations();
+  };
+
+  // ── 첫 관심 선택: 실제 추천을 미리 만들고 진행 상태를 보여 준다 ────
+  let interestPreviewTimer = null;
+  let interestPreviewRun = 0;
+  let interestPreviewProgress = null;
+  Cloud.interestPreview = null;
+
+  const interestSignature = (interests) => [...new Set(interests || [])].sort().join('|');
+  const selectedInterestNames = (interests) => (interests || []).join(' · ');
+
+  function ensureInterestAiPanel() {
+    const screen = document.querySelector('#interests');
+    const intro = screen?.querySelector(':scope > .sub');
+    if (!screen || !intro) return null;
+    let panel = screen.querySelector('#interestAiPanel');
+    if (!panel) {
+      panel = document.createElement('section');
+      panel.id = 'interestAiPanel';
+      panel.className = 'interest-ai-panel';
+      panel.hidden = true;
+      panel.setAttribute('aria-live', 'polite');
+      intro.insertAdjacentElement('afterend', panel);
+    }
+    return panel;
+  }
+
+  function interestAgentProgressHTML(interests) {
+    const names = selectedInterestNames(interests);
+    return `<div class="interest-ai-heading"><i aria-hidden="true"></i><div><strong>생성형 AI가 추천을 만들고 있어요</strong><p class="odot-busy-detail">${names} 관심을 바탕으로 첫 카드를 준비해요.</p></div></div>`
+      + `<p class="odot-agent-live" role="status" aria-live="polite"><i aria-hidden="true"></i><span>${names} 관심을 정리하고 있어요.</span></p>`
+      + `<ol class="odot-agent-progress" aria-label="추천 카드 생성 진행"><li class="is-active" data-live="${names} 관심을 정리하고 있어요."><span aria-hidden="true">1</span>관심 신호 정리</li><li data-live="어울리는 키워드를 고르고 있어요."><span aria-hidden="true">2</span>키워드 선택</li><li data-live="첫 추천 카드를 다듬고 있어요."><span aria-hidden="true">3</span>추천 카드 구성</li></ol>`;
+  }
+
+  function showInterestAiReady(interests, cards) {
+    const panel = ensureInterestAiPanel();
+    if (!panel) return;
+    const first = cards?.[0];
+    panel.hidden = false;
+    panel.innerHTML = `<div class="interest-ai-ready"><i aria-hidden="true">✓</i><div><strong>첫 추천 카드 준비 완료</strong><p>${selectedInterestNames(interests)} 관심을 반영해 ‘${first?.title || '새로운 주제'}’부터 준비했어요.</p></div></div>`;
+  }
+
+  function scheduleInterestPreview(interests) {
+    const selected = [...new Set(interests || [])];
+    const panel = ensureInterestAiPanel();
+    clearTimeout(interestPreviewTimer);
+    interestPreviewProgress?.stop?.();
+    if (!panel || !Cloud.online || !Cloud.ai || !selected.length) {
+      if (panel) panel.hidden = true;
+      return;
+    }
+
+    const signature = interestSignature(selected);
+    if (Cloud.interestPreview?.signature === signature && Cloud.interestPreview.cards?.length) {
+      showInterestAiReady(selected, Cloud.interestPreview.cards);
+      return;
+    }
+
+    const run = ++interestPreviewRun;
+    panel.hidden = false;
+    panel.innerHTML = interestAgentProgressHTML(selected);
+    interestPreviewProgress = startBusyCopyRotation(panel);
+
+    // 칩을 연달아 고를 때는 마지막 선택만 실제 AI 요청으로 보낸다.
+    interestPreviewTimer = setTimeout(async () => {
+      const cards = await fetchKeywordCards(3, { interests: selected });
+      if (run !== interestPreviewRun || signature !== interestSignature(globalThis.state?.interests)) return;
+      if (!cards.length) {
+        panel.hidden = true;
+        return;
+      }
+      Cloud.interestPreview = { signature, cards };
+      await interestPreviewProgress?.finish?.();
+      showInterestAiReady(selected, cards);
+  }, 450);
+  }
+
+  // 관심을 탭하거나 직접 추가한 뒤의 state를 읽어, 화면 반응과 실제 생성 요청을 맞춘다.
+  document.addEventListener('click', (event) => {
+    if (!event.target?.closest?.('[data-interest], #addCustomInterest')) return;
+    setTimeout(() => scheduleInterestPreview(globalThis.state?.interests || []), 0);
+  });
+
+  // 선택 화면에서 미리 만든 카드를 다음 단계의 첫 묶음으로 바로 이어 붙인다.
+  const aiGetRecommendations = MockAPI.getRecommendations.bind(MockAPI);
+  MockAPI.getRecommendations = async () => {
+    const signature = interestSignature(Cloud.interests());
+    const preview = Cloud.interestPreview;
+    if (preview?.signature === signature && preview.cards?.length) {
+      Cloud.interestPreview = null;
+      setTimeout(() => prefetchAhead(), 0);
+      return preview.cards;
+    }
+    return aiGetRecommendations();
   };
 
   /**
