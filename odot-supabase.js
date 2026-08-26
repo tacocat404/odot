@@ -2755,7 +2755,9 @@ function attach() {
       if (!replacingInsight && document.querySelector('#review')?.classList.contains('active')) {
         queueLiveInsightRender();
       }
-    }).observe(insightRoot, { childList: true, subtree: true });
+    // reviewContent 자체가 통째로 교체될 때만 구형 렌더로 판단한다.
+    // 날짜 버튼이 상세 문구만 바꾸는 것은 정상 상호작용이므로 감시하지 않는다.
+    }).observe(insightRoot, { childList: true });
   }
   document.querySelectorAll('.nav[data-target="review"]').forEach((button) => {
     // 캡처 단계에서 예약해 기존 onclick/async 렌더가 끝난 뒤에도 실제 값을 보장한다.
