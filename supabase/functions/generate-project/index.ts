@@ -1,5 +1,5 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { cleanInput, cleanInputs, isSafeOutput } from "../_shared/safety.ts";
+import { cleanInput, isSafeOutput } from "../_shared/safety.ts";
 
 // F-PEBLKV · AI 프로젝트 할 일 목록 생성
 // OpenAI 키는 Edge Function 시크릿에만 존재한다. 클라이언트로 절대 내려가지 않는다.
@@ -41,8 +41,6 @@ Deno.serve(async (req: Request) => {
   let payload: {
     duration?: string;
     category?: string;
-    interests?: string[];
-    likedTitles?: string[];
     goal?: string;
     taskCount?: number;
     survey?: { q?: string; a?: string }[];
@@ -59,8 +57,6 @@ Deno.serve(async (req: Request) => {
   const category = CATEGORIES.includes(payload.category ?? "")
     ? payload.category!
     : "기타";
-  const interests = cleanInputs(payload.interests, 20, 5);
-  const likedTitles = cleanInputs(payload.likedTitles, 40, 10);
   const goal = cleanInput(payload.goal, 60) ?? "";
   // 할 일이 뜬구름 잡지 않으려면 재료가 필요하다.
   // 설문 답(쓸 수 있는 시간·중단 이유), 이 프로젝트를 만든 카드의 설명, 실제 기간.
@@ -72,6 +68,7 @@ Deno.serve(async (req: Request) => {
     .map((c) => ({ title: cleanInput(c?.title, 40), intro: cleanInput(c?.intro, 120) }))
     .filter((c): c is { title: string; intro: string } => Boolean(c.title))
     .slice(0, 5);
+  if (!cards.length) return json({ error: "no_project_cards" }, 400);
   const days = Number.isFinite(payload.days) ? Math.min(Math.max(Number(payload.days), 1), 400) : null;
   // 호출자가 개수를 지정할 수 있다. 프로젝트 카드의 단계 수와 정확히 맞춰야 하기 때문이다.
   const taskCount = Number.isInteger(payload.taskCount)
@@ -116,10 +113,6 @@ Deno.serve(async (req: Request) => {
       : "",
     survey.length
       ? ["설문 답변:", ...survey.map((item) => `- ${item.q} → ${item.a}`)].join("\n")
-      : "",
-    interests.length ? `사용자가 고른 관심 분야: ${interests.join(", ")}` : "",
-    likedTitles.length
-      ? `사용자가 관심을 표시한 주제: ${likedTitles.join(" / ")}`
       : "",
     "",
     `할 일은 정확히 ${taskCount}개 만든다.`,

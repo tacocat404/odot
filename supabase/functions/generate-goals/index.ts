@@ -1,7 +1,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { cleanInput, cleanInputs, isSafeOutput } from "../_shared/safety.ts";
+import { cleanInput, isSafeOutput } from "../_shared/safety.ts";
 
-// F-URTMLV · 분기 설문 + 좋아요한 키워드 → 카테고리별 목표 후보
+// F-URTMLV · 프로젝트 카드 + 설문 → 카테고리별 목표 후보
 //
 // 프로토타입은 카테고리마다 고정된 목표 3개를 하드코딩해 두고 있었다.
 // 여기서는 사용자가 실제로 고른 키워드와 설문 답변을 함께 넣어 목표를 만든다.
@@ -42,7 +42,6 @@ Deno.serve(async (req: Request) => {
 
   let payload: {
     categories?: string[];
-    keywords?: string[];
     survey?: { q?: string; a?: string }[];
     cards?: { title?: string; category?: string; intro?: string }[];
   };
@@ -52,12 +51,6 @@ Deno.serve(async (req: Request) => {
     return json({ error: "invalid_json" }, 400);
   }
 
-  const categories = (payload.categories ?? [])
-    .filter((c) => CATEGORIES.includes(c))
-    .slice(0, 5);
-  if (!categories.length) return json({ error: "no_categories" }, 400);
-
-  const keywords = cleanInputs(payload.keywords, 30, 15);
   // 이번 프로젝트를 만드는 카드. 분야별 목표는 그 분야의 카드에서만 나와야 한다.
   const cards = (payload.cards ?? [])
     .map((c) => ({
@@ -68,6 +61,14 @@ Deno.serve(async (req: Request) => {
     .filter((c): c is { title: string; category: string; intro: string } =>
       Boolean(c.title && c.category))
     .slice(0, 12);
+  if (!cards.length) return json({ error: "no_project_cards" }, 400);
+
+  // 요청한 분야도 실제 프로젝트 카드가 가진 분야 안에서만 허용한다.
+  const cardCategories = new Set(cards.map((card) => card.category));
+  const categories = (payload.categories ?? [])
+    .filter((c) => CATEGORIES.includes(c) && cardCategories.has(c))
+    .slice(0, 5);
+  if (!categories.length) return json({ error: "no_project_card_categories" }, 400);
 
   const cardLines = CATEGORIES
     .map((cat) => {
@@ -92,6 +93,7 @@ Deno.serve(async (req: Request) => {
     "- 분야별 카드가 주어지면, 그 분야의 목표는 반드시 '그 분야의 카드'에서만 만든다.",
     "- 다른 분야의 카드나 예전에 좋아요한 주제를 끌어와 쓰지 않는다. 이번에 고른 카드가 전부다.",
     "- 카드 주제를 목표 안에 실제로 녹인다. 카드와 무관한 일반적인 목표를 쓰지 않는다.",
+    "- source_card 에는 이 목표를 만든 프로젝트 카드 제목을 원문 그대로 하나 넣는다. 다른 카드 제목은 쓰지 않는다.",
     "",
     "제목이 서로 닮지 않게 하는 규칙(가장 중요):",
     "- 한 분야의 세 후보는 아래 세 형태를 '하나씩' 맡는다. 셋 다 같은 형태면 실패다.",
@@ -109,9 +111,7 @@ Deno.serve(async (req: Request) => {
   ].join("\n");
 
   const user = [
-    cardLines.length
-      ? ["이번 프로젝트를 만드는 카드(분야별):", ...cardLines].join("\n")
-      : (keywords.length ? `사용자가 좋아요한 키워드: ${keywords.join(", ")}` : "좋아요한 키워드 없음"),
+    ["이번 프로젝트를 만드는 카드(분야별):", ...cardLines].join("\n"),
     "",
     survey.length ? "설문 답변:" : "",
     ...survey.map((item) => `- ${item.q} → ${item.a}`),
@@ -119,7 +119,7 @@ Deno.serve(async (req: Request) => {
     `다음 분야마다 목표 후보를 정확히 3개씩 만든다: ${categories.join(", ")}`,
     "각 분야의 3개는 단기 1개, 중기 1개, 장기 1개다.",
     "다음 JSON 형태로만 답한다:",
-    '{"goals":{"공부":[{"title":"이번 주 우주과학 개념 3개 정리","period":"단기","fit":92}]}}',
+    '{"goals":{"공부":[{"title":"이번 주 우주과학 개념 3개 정리","period":"단기","fit":92,"source_card":"우주과학 다큐 한 편 보기"}]}}',
   ]
     .filter(Boolean)
     .join("\n");
@@ -167,11 +167,13 @@ Deno.serve(async (req: Request) => {
 
   for (const category of categories) {
     const list = Array.isArray(source[category]) ? source[category] as Record<string, unknown>[] : [];
+    const sourceTitles = new Set(cards.filter((card) => card.category === category).map((card) => card.title));
     // 프로토타입은 [제목, 기간, FIT] 튜플 배열을 기대한다.
     const rows = list
       .map((item, i): [string, string, number] | null => {
         const title = String(item?.title ?? "").trim().slice(0, 40);
         if (!title) return null;
+        if (!sourceTitles.has(String(item?.source_card ?? "").trim())) return null;
         if (!isSafeOutput(title)) { console.warn("blocked_goal", title); return null; }
         const period = PERIODS.includes(String(item?.period))
           ? String(item.period)

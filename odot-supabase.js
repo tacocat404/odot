@@ -35,6 +35,7 @@ const Cloud = {
   surveySignature: null,     // 그 설문을 만든 카드·초점 조합
   surveyRequest: null,       // 진행 중인 요청 { signature, promise }
   surveyPending: false,
+  projectCards: [],          // 이번 흐름에서만 고른 프로젝트 카드 (관심 카드와 분리)
 
   interests() {
     return globalThis.Storage?.read?.()?.interests || [];
@@ -138,6 +139,7 @@ function resetLocalState() {
   Cloud.keywordBySlug.clear();
   Cloud.survey = null;
   Cloud.surveySignature = null;
+  Cloud.projectCards = [];
   // 목표 표는 전역이라 비우지 않으면 앞 계정의 목표가 다음 계정에 남는다.
   if (globalThis.decisionGoals) {
     Object.keys(globalThis.decisionGoals).forEach((k) => { delete globalThis.decisionGoals[k]; });
@@ -597,9 +599,9 @@ async function invoke(fn, body) {
 }
 
 /** F-PEBLKV · AI 프로젝트 생성 */
-async function generateProjectViaAI({ category, duration, interests, likedTitles, goal, taskCount }) {
+async function generateProjectViaAI({ category, duration, goal, taskCount, survey, cards, days }) {
   const data = await invoke('generate-project', {
-    category, duration, interests, likedTitles, goal, taskCount,
+    category, duration, goal, taskCount, survey, cards, days,
   });
   if (!data?.tasks?.length) return null;
   return data;
@@ -715,7 +717,7 @@ async function generateGoalsViaAI({ categories, keywords, survey, cards }) {
  * 목표가 나왔다(배드민턴 카드를 안 골랐는데 배드민턴 목표가 나오는 식).
  */
 function currentRunCards() {
-  return (globalThis.state?.decisionLikes || []).map((card) => ({
+  return (Cloud.projectCards || []).map((card) => ({
     title: String(card.title || '').replace('\n', ' ').trim(),
     category: card.category,
     intro: card.intro || '',
@@ -947,17 +949,23 @@ function attach() {
   const Catalog = globalThis.Catalog;
   if (!MockAPI || !Storage) return;
 
-  // 프로젝트 생성 경로에서 쓰는 맥락. 카드 생성과 달리 좋아요 이력은 보지 않고,
-  // 이번에 후보로 올라온 프로젝트 카드만 본다.
-  const likedContext = () => {
-    const cards = currentRunCards();
-    return {
-      interests: Cloud.interests(),
-      likedCategories: [...new Set(cards.map((c) => c.category))],
-      likedTitles: cards.map((c) => c.title),
-      cards,
-    };
+  /**
+   * 관심 카드함은 다음 추천을 정교하게 만드는 장기 기억이다.
+   * 이번 프로젝트에는 현재 탐색 중 오른쪽으로 넘긴 카드만 들어간다. 이전 세션의
+   * 후보 표시가 state.decisionLikes 로 되살아나는 몽키패치를 여기서 차단한다.
+   */
+  const syncCurrentProjectCards = () => {
+    const cards = Cloud.projectCards.map((card) => ({ ...card }));
+    if (globalThis.state) globalThis.state.decisionLikes = cards;
   };
+  const demoteSavedCards = () => {
+    const data = Storage.read();
+    if (!data.cardStore?.cards) return;
+    data.cardStore.cards = data.cardStore.cards.map((card) => ({ ...card, candidate: false }));
+    Storage.write(data);
+  };
+  demoteSavedCards();
+  syncCurrentProjectCards();
 
   // 관심사 저장 미러
   const baseSaveInterests = MockAPI.saveInterests.bind(MockAPI);
@@ -1052,7 +1060,15 @@ function attach() {
   const baseReact = globalThis.react;
   if (typeof baseReact === 'function') {
     globalThis.react = async (type) => {
+      const topic = globalThis.activeTopic?.();
+      if (type === 'like' && topic && !Cloud.projectCards.some((card) => card.id === topic.id)) {
+        // 이 한 번의 선택만 이번 프로젝트의 재료다. 관심 카드함에도 저장되지만,
+        // 이후 추천에만 쓰이고 다음 프로젝트에 자동으로 넘어오지 않는다.
+        Cloud.projectCards.push({ ...topic });
+      }
       await baseReact(type);
+      demoteSavedCards();
+      syncCurrentProjectCards();
       prefetchAhead();
       // 좋아요가 쌓일 때마다 설문을 미리 만들어 둔다(응답을 기다리지 않는다).
       if (type === 'like') prepareSurvey();
@@ -1130,6 +1146,28 @@ function attach() {
     .focus-option small{margin-top:2px;color:var(--primary,#7152a6);font-size:10.5px;font-weight:900}
   `;
   document.head.append(focusStyle);
+
+  // 설문마다 '왜 이 질문을 받는지'를 선택 카드 바로 아래에서 설명한다.
+  const baseRenderDecisionQuestion = globalThis.renderDecisionQuestion;
+  if (typeof baseRenderDecisionQuestion === 'function') {
+    globalThis.renderDecisionQuestion = (...args) => {
+      const result = baseRenderDecisionQuestion(...args);
+      const flow = document.querySelector('#decisionFlow');
+      const card = currentRunCards().find((item) => item.title === globalThis.state?.decisionFocus)
+        || currentRunCards()[0];
+      const flowCard = flow?.querySelector('.flow-card');
+      if (!flowCard || !card) return result;
+      flowCard.querySelector('.survey-card-context')?.remove();
+      const helper = document.createElement('p');
+      helper.className = 'survey-card-context';
+      helper.textContent = `‘${card.title}’ 카드에서 이어져, 무엇을 어떻게 해보고 싶은지 물어봐요.`;
+      flowCard.querySelector('.sub')?.insertAdjacentElement('afterend', helper);
+      return result;
+    };
+  }
+  const surveyContextStyle = document.createElement('style');
+  surveyContextStyle.textContent = `.survey-card-context{margin:10px 0 0;padding:9px 10px;border-radius:11px;background:#f6f1fc;color:#67459a;font-size:11px;font-weight:800;line-height:1.5}`;
+  document.head.append(surveyContextStyle);
 
   // 설문 시작 시점에 준비된 문항으로 갈아끼운다. 없으면 기존 고정 문항을 쓴다.
   const baseStartDecision = globalThis.startDecision;
@@ -1725,10 +1763,8 @@ function attach() {
 
   /** 선택한 목표마다 할 일을 만들어 localStorage 에 담아 둔다. */
   async function buildTasksFor(picks) {
-    const interests = Cloud.interests();
     // 목표와 마찬가지로, 할 일도 이번에 고른 카드에서만 나와야 한다.
     const runCards = currentRunCards();
-    const keywords = runCards.map((c) => c.title);
     const sourceByKey = {}; // 프로젝트별로 '실제로 쓰인 카드'를 담아 둔다
 
     // 할 일이 구체적으로 나오려면 재료가 필요하다.
@@ -1738,15 +1774,15 @@ function attach() {
 
     const results = await Promise.all(picks.map(async (pick) => {
       const period = pick.goal?.[1];
-      const cards = (globalThis.state?.decisionLikes || [])
+      const cards = runCards
         .filter((c) => c.category === pick.category)
         .map((c) => ({ title: String(c.title || '').replace('\n', ' '), intro: c.intro || '' }));
+      // 같은 분야의 이번 프로젝트 카드가 없다면, 관심 카드나 기본 표로 대신 만들지 않는다.
+      if (!cards.length) return null;
 
       const ai = await generateProjectViaAI({
         category: pick.category,
         duration: PERIOD_TO_DURATION[period] || '1주',
-        interests,
-        likedTitles: keywords,
         survey,
         cards,
         days: PERIOD_DAYS[period] || 7,
@@ -1771,7 +1807,7 @@ function attach() {
       await persistProject({
         title: pick.goal?.[0] || ai.title,
         category: pick.category,
-        keywords: ai.keywords?.length ? ai.keywords : keywords,
+        keywords: ai.keywords?.length ? ai.keywords : cards.map((card) => card.title),
         tasks: ai.tasks,
         projectKey: pick.key, // 완료 체크를 DB 행에 잇기 위한 키
         period,
@@ -1998,23 +2034,18 @@ function attach() {
     });
   }
 
-  // 프로젝트 생성: AI 우선, 실패하면 기존 목업
-  const baseCreateProject = MockAPI.createProject.bind(MockAPI);
+  // 이 경로도 프로젝트 카드가 있을 때만 AI 프로젝트를 만든다.
+  // 카드가 없거나 AI가 실패했을 때 고정 목업을 만들면 카드 밖 주제가 섞이므로 중단한다.
   MockAPI.createProject = async ({ category, duration }) => {
-    const ctx = likedContext();
+    const cards = currentRunCards().filter((card) => card.category === category);
+    if (!cards.length) return null;
     const ai = await generateProjectViaAI({
       category,
       duration,
-      interests: ctx.interests,
-      likedTitles: ctx.likedTitles,
-      cards: ctx.cards,
+      cards,
+      survey: surveyAnswers(),
     });
-
-    if (!ai) {
-      const fallback = await baseCreateProject({ category, duration });
-      persistProject({ ...fallback, keywords: ctx.interests }, duration);
-      return fallback;
-    }
+    if (!ai) return null;
 
     const project = {
       id: `ai-${Date.now()}`,
