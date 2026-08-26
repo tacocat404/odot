@@ -2165,15 +2165,47 @@ function attach() {
     }
   }
 
-  // 인사이트 화면이 그려진 뒤 주간 막대를 바로잡는다.
+  /**
+   * '관심의 비중' 타일의 숫자 크기를 비중에 맞춘다.
+   *
+   * 원래는 모든 타일이 clamp(32px,10vw,48px) 로 같은 크기여서, 7% 가 36% 만큼
+   * 크게 보였다. 가장 큰 비중을 기준으로 줄여 눈으로도 차이가 읽히게 한다.
+   */
+  function scaleShareNumbers() {
+    const tiles = [...document.querySelectorAll('.stat-tile')];
+    if (!tiles.length) return;
+
+    const read = (tile) => Number(String(tile.querySelector('strong')?.textContent || '').replace(/\D/g, '')) || 0;
+    const max = Math.max(...tiles.map(read), 1);
+
+    tiles.forEach((tile) => {
+      const value = tile.querySelector('strong');
+      if (!value) return;
+      const share = read(tile) / max;
+      // 가장 큰 비중이 48px, 아주 작은 비중도 18px 아래로는 내리지 않는다.
+      let size = 18 + 30 * share;
+      // 타일이 낮으면 숫자가 넘치므로 높이에도 맞춘다.
+      const height = tile.getBoundingClientRect().height;
+      if (height) size = Math.min(size, height * 0.52);
+      value.style.setProperty('font-size', `${Math.round(size)}px`, 'important');
+      value.style.setProperty('letter-spacing', size > 34 ? '-2.4px' : '-1.2px', 'important');
+    });
+  }
+
+  // 인사이트 화면이 그려진 뒤 주간 막대와 비중 숫자를 바로잡는다.
   const baseRenderReviewForWeek = globalThis.renderReview;
   if (typeof baseRenderReviewForWeek === 'function') {
     globalThis.renderReview = async (...args) => {
       const result = await baseRenderReviewForWeek(...args);
       await renderWeeklyBars();
+      scaleShareNumbers();
       return result;
     };
   }
+  // 화면 폭이 바뀌면 타일 높이도 바뀌므로 다시 맞춘다.
+  window.addEventListener('resize', () => {
+    if (document.querySelector('#review')?.classList.contains('active')) scaleShareNumbers();
+  });
 
   // 앱 재시작 시 프로젝트 복원은 이 모듈보다 먼저 끝난다.
   // 그 결과에도 할 일·출처 카드·조작 버튼을 똑같이 입힌다.
