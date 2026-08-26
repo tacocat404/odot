@@ -1158,28 +1158,5 @@ renderOnboarding=()=>{
 };
 renderOnboarding();
 </script>
-<script>
-/* Presentation slide 07's card stack becomes the real discovery-card treatment. */
-const presentationCardStyle=document.createElement('style');
-presentationCardStyle.textContent=`
-  #explore .deck{isolation:isolate}
-  #explore .topic-card{border:1px solid #e7e1d9!important;box-shadow:0 14px 28px rgba(52,39,25,.13)!important}
-  #explore .topic-card:before{display:none!important}
-  #explore .topic-card.back-2{z-index:0!important;opacity:1!important;background:var(--wash)!important;border:0!important;transform:rotate(-4deg) translate(-7px,10px) scale(.96)!important}
-  #explore .topic-card.back-1{z-index:1!important;opacity:1!important;background:var(--wash)!important;border:0!important;transform:rotate(3deg) translate(8px,12px) scale(.97)!important}
-  #explore .topic-card.back-1>*{opacity:0}
-  #explore #activeCard{z-index:2!important;display:flex!important;justify-content:flex-end!important;padding:27px!important;background:#fffdf9!important}
-  #explore #activeCard .topic-tag{margin:0 0 9px!important;padding:0!important;border-radius:0!important;background:transparent!important;color:var(--topic)!important;font-size:12px!important;font-weight:900!important}
-  #explore #activeCard h2{max-width:100%!important;margin:0!important;font-size:30px!important;line-height:1.18!important;letter-spacing:-1.75px!important}
-  #explore #activeCard .sub{max-width:94%!important;margin:11px 0 0!important;color:#716b64!important;font-size:14px!important;line-height:1.55!important}
-  #explore #activeCard .reason{max-width:100%!important;margin:18px 0 0!important;padding:10px 0 0!important;border:0!important;border-top:1px solid #ece6dd!important;border-radius:0!important;background:transparent!important;color:#827a70!important;font-size:11px!important}
-  #explore #activeCard .topic-mascot{display:none!important}
-  #explore .swipe-stamp{z-index:6!important}
-  @media(max-width:360px){#explore #activeCard{padding:23px!important}#explore #activeCard h2{font-size:27px!important}}
-  @media(prefers-reduced-motion:reduce){#explore .topic-card{transition:none!important}}
-`;
-document.head.append(presentationCardStyle);
-renderDeck();
-</script>
 <script type="module" src="odot-supabase.js"></script>
 </body></html>
