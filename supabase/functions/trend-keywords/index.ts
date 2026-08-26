@@ -89,7 +89,7 @@ Deno.serve(async (req: Request) => {
   const savedCards = cleanInputs(payload.savedCards, 40, 12);
   // '기타'에 손으로 적은 관심사. 분야가 정해져 있지 않으므로 여러 분야로 펼친다.
   const customInterests = cleanInputs(payload.customInterests, 20, 5);
-  const count = Math.min(Math.max(payload.count ?? 5, 1), 8);
+  const count = Math.min(Math.max(payload.count ?? 5, 1), 10);
 
   const trends = await fetchTrends();
 

@@ -17,10 +17,11 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 const SUPABASE_URL = 'https://hqbbynkwxavatfariycj.supabase.co';
 const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_5FIr1LRtmXwGjkJDw9G2Ug_3yqqcKFi';
 
-// 초기 트렌드 카드 장수, 그리고 항상 확보해 둘 "앞선 카드" 수.
-// 5장으로 시작하고, 2번 카드를 볼 때(current=1, 남은 카드 4장) 6번째를 미리 만든다.
-const INITIAL_CARDS = 5;
-const BUFFER_AHEAD = 4;
+// 처음에는 10장을 준비한다. 첫 5장은 바로 보여 주고, 나머지 5장은 뒤에서 이어
+// 받아 첫 장을 고르는 시간을 늘리지 않는다.
+const INITIAL_CARDS = 10;
+const INITIAL_VISIBLE_CARDS = 5;
+const BUFFER_AHEAD = 6;
 const MAX_PARALLEL_FETCH = 2;
 
 const Cloud = {
@@ -839,6 +840,18 @@ function busyCardHTML(detail) {
   </div>`;
 }
 
+/**
+ * 생성 중 화면에는 모델의 내부 사고가 아니라, 사용자에게 확인 가능한 작업 단계만
+ * 보여 준다. 기다리는 이유와 다음에 일어날 일을 알 수 있게 하는 안내다.
+ */
+function agentProgressHTML(detail, steps) {
+  const labels = Array.isArray(steps) ? steps.filter(Boolean).slice(0, 3) : [];
+  if (!labels.length) return busyCardHTML(detail);
+  return `${busyCardHTML(detail)}<ol class="odot-agent-progress" aria-label="생성 진행 단계">${labels
+    .map((label, index) => `<li class="${index === 0 ? 'is-active' : ''}"><span>${index + 1}</span>${label}</li>`)
+    .join('')}</ol>`;
+}
+
 /** 3초 넘게 걸리면 문구를 한 번 바꿔 멈춘 게 아님을 알린다. */
 function startBusyCopyRotation(root) {
   const detail = root?.querySelector('.odot-busy-detail');
@@ -866,6 +879,11 @@ function installBusyStyles() {
     .odot-busy-dot{width:34px;height:34px;border-radius:50%;
       background:color-mix(in srgb,var(--primary,#7152a6) 26%,#fff);
       animation:odotBusyPulse 1.25s ease-in-out infinite}
+    .odot-agent-progress{display:grid;gap:7px;width:min(100%,300px);margin:0 auto 4px;padding:0;list-style:none}
+    .odot-agent-progress li{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:11px;font-weight:800}
+    .odot-agent-progress li span{display:grid;place-items:center;width:18px;height:18px;border-radius:50%;background:#f0ebf8;color:#76658b;font-size:10px}
+    .odot-agent-progress li.is-active{color:var(--ink);font-weight:900}
+    .odot-agent-progress li.is-active span{background:var(--primary,#7152a6);color:#fff;box-shadow:0 0 0 4px color-mix(in srgb,var(--primary,#7152a6) 12%,transparent)}
     @keyframes odotBusyPulse{0%,100%{transform:scale(.82);opacity:.55}50%{transform:scale(1);opacity:1}}
     .odot-buffer-hint{display:inline-flex;align-items:center;gap:6px;margin-left:8px;
       color:var(--muted);font-size:11px;font-weight:800}
@@ -1294,7 +1312,9 @@ function attach() {
         const flow = document.querySelector('#decisionFlow');
         if (flow) {
           globalThis.setDecisionMode?.(true);
-          flow.innerHTML = `<div class="flow-card">${busyCardHTML('고른 주제로 질문을 만드는 중')}</div>`;
+          flow.innerHTML = `<div class="flow-card">${agentProgressHTML('고른 주제로 질문을 만드는 중', [
+            '선택 카드 확인', '관심 방향 정리', '질문 구성',
+          ])}</div>`;
           startBusyCopyRotation(flow);
         }
         await prepareSurvey();
@@ -1749,7 +1769,9 @@ function attach() {
     card.innerHTML = busyCardHTML('오늘의 키워드를 고르는 중');
     startBusyCopyRotation(card);
 
-    const cards = await fetchKeywordCards(INITIAL_CARDS);
+    // 첫 묶음은 빠르게 보여 주고, 나머지는 같은 세션에서 곧바로 채운다.
+    // 10장을 한 호출에서 기다리게 하면 첫 카드가 오히려 늦어질 수 있다.
+    const cards = await fetchKeywordCards(INITIAL_VISIBLE_CARDS);
     if (!cards.length) {
       // AI 를 못 쓰면 프로토타입의 내장 덱으로 되돌아간다.
       state.deck = await baseGetRecommendations();
@@ -1761,6 +1783,30 @@ function attach() {
     state.deck = cards;
     state.current = 0;
     globalThis.renderDeck?.();
+    warmInitialDeck(state, cards);
+  }
+
+  /** 첫 카드가 보인 뒤 총 10장까지 조용히 채운다. */
+  async function warmInitialDeck(state, initialCards) {
+    const missing = Math.max(0, INITIAL_CARDS - initialCards.length);
+    if (!missing || !Cloud.ai) return;
+    Cloud.inFlight += 1;
+    updateBufferHint();
+    try {
+      const fresh = await fetchKeywordCards(missing);
+      // 다른 계정으로 전환하거나 덱이 새로 열렸다면 이전 요청 결과는 섞지 않는다.
+      if (state.deck !== initialCards || !fresh.length) return;
+      const known = new Set(state.deck.map((card) => card.id));
+      const unique = fresh.filter((card) => !known.has(card.id));
+      if (unique.length) {
+        state.deck.push(...unique);
+        refreshUpcoming();
+      }
+    } finally {
+      Cloud.inFlight -= 1;
+      updateBufferHint();
+      prefetchAhead();
+    }
   }
 
   // 로그인 이후(부팅 시 세션 복원 포함)에 세션이 잡히면 덱을 채운다.
@@ -1799,7 +1845,9 @@ function attach() {
 
       const flow = document.querySelector('#decisionFlow');
       if (flow) {
-        flow.innerHTML = `<div class="flow-card">${busyCardHTML('답변에 맞는 목표를 고르는 중')}</div>`;
+        flow.innerHTML = `<div class="flow-card">${agentProgressHTML('답변에 맞는 목표를 고르는 중', [
+          '선택 카드 확인', '설문 답 반영', '목표 후보 정리',
+        ])}</div>`;
         startBusyCopyRotation(flow);
       }
 
@@ -1839,6 +1887,7 @@ function attach() {
       } finally {
         state.decisionLikes = all;
       }
+      polishGoalChoices();
       wireConfirmButton();
     };
   }
@@ -1849,6 +1898,45 @@ function attach() {
     if (!table) return;
     Object.keys(table).forEach((key) => { delete table[key]; });
   }
+
+  const PERIOD_BADGE = { 단기: '이번 주', 중기: '한 달', 장기: '3개월' };
+
+  /** 제목 앞의 기간 표현을 배지로 옮겨 목표 문장을 한 번에 읽게 한다. */
+  function goalDisplayTitle(title) {
+    return String(title || '').replace(
+      /^(?:이번\s*주|한\s*달\s*(?:뒤|안에)?|1개월\s*(?:뒤|안에)?|3개월\s*(?:뒤|안에)?|세\s*달\s*(?:뒤|안에)?|4주\s*(?:동안|안에)?|12주\s*(?:동안|안에)?)\s*[,·:!-]?\s*/,
+      '',
+    ) || String(title || '새 목표');
+  }
+
+  function polishGoalChoices() {
+    const table = globalThis.decisionGoals || {};
+    document.querySelectorAll('#decisionGoals .goal-choice[data-goal]').forEach((button) => {
+      const goals = table[button.dataset.category] || table.기타 || [];
+      const goal = goals[Number(button.dataset.goal)];
+      const period = goal?.[1];
+      const title = button.querySelector('strong');
+      const detail = button.querySelector('small');
+      if (title) title.textContent = goalDisplayTitle(goal?.[0] || title.textContent);
+      if (!detail) return;
+      detail.replaceChildren();
+      const badge = document.createElement('span');
+      badge.className = 'goal-period-badge';
+      badge.textContent = PERIOD_BADGE[period] || String(period || '프로젝트');
+      const support = document.createElement('span');
+      support.className = 'goal-support';
+      support.textContent = '지금의 여유에 맞춘 추천';
+      detail.append(badge, support);
+    });
+  }
+
+  const goalChoicePolishStyle = document.createElement('style');
+  goalChoicePolishStyle.textContent = `
+    .goal-choice small{display:flex;align-items:center;flex-wrap:wrap;gap:7px}
+    .goal-period-badge{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;background:#f1ebfb;color:#6841a1;font-size:10px;font-weight:900;letter-spacing:-.1px}
+    .goal-support{color:var(--muted);font-size:11px;font-weight:700}
+  `;
+  document.head.append(goalChoicePolishStyle);
 
   function showGoalTrouble(message, retry) {
     const flow = document.querySelector('#decisionFlow');
@@ -1875,6 +1963,13 @@ function attach() {
       const label = confirm.textContent;
       confirm.disabled = true;
       confirm.textContent = '밍밍이가 할 일을 만드는 중…';
+      const flow = document.querySelector('#decisionFlow');
+      if (flow) {
+        flow.innerHTML = `<div class="flow-card">${agentProgressHTML('선택한 목표를 실행 계획으로 바꾸는 중', [
+          '프로젝트 목적 확인', '실행 단계 구성', '계획 검증',
+        ])}</div>`;
+        startBusyCopyRotation(flow);
+      }
       try {
         await buildTasksFor(picks);
       } finally {
