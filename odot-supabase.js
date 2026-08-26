@@ -32,7 +32,8 @@ const Cloud = {
   keywordBySlug: new Map(),  // slug -> 키워드 문자열
   inFlight: 0,               // 진행 중인 카드 생성 요청 수
   survey: null,              // 미리 만들어 둔 설문 문항
-  surveySignature: null,     // 그 설문을 만든 좋아요 키워드 조합
+  surveySignature: null,     // 그 설문을 만든 카드·초점 조합
+  surveyRequest: null,       // 진행 중인 요청 { signature, promise }
   surveyPending: false,
 
   interests() {
@@ -170,6 +171,49 @@ async function hydrateFromCloud() {
     globalThis.Storage?.write?.(store);
 
     if (globalThis.state) globalThis.state.interests = store.interests;
+    await hydrateProjects();
+  });
+}
+
+/**
+ * 진행 중 프로젝트와 할 일을 DB 에서 로컬로 되살린다.
+ *
+ * 화면은 localStorage 의 activeProjects · aiTasks · aiTaskIds 를 읽는다.
+ * 이걸 복원하지 않으면 다른 기기에서 로그인했을 때 프로젝트 탭이 비어 보인다.
+ */
+async function hydrateProjects() {
+  return safe('hydrateProjects', async () => {
+    const { data, error } = await Cloud.client
+      .from('projects')
+      .select('id, client_key, title, category, period, started_on, completed_at, tasks(id, content, position, completed_at), project_notes:tasks(id)')
+      .eq('user_id', Cloud.userId)
+      .not('client_key', 'is', null)
+      .order('created_at');
+    if (error) throw error;
+    if (!data?.length) return;
+
+    const store = globalThis.Storage?.read?.() || {};
+    const active = [];
+    store.aiTasks = store.aiTasks || {};
+    store.aiTaskIds = store.aiTaskIds || {};
+
+    data.filter((p) => !p.completed_at).forEach((project) => {
+      const tasks = (project.tasks || []).slice().sort((a, b) => a.position - b.position);
+      const key = project.client_key;
+      store.aiTasks[key] = tasks.map((t) => t.content);
+      store.aiTaskIds[key] = tasks.map((t) => t.id);
+      active.push({
+        key,
+        category: project.category,
+        goal: [project.title, project.period || '단기', 90],
+        startedAt: project.started_on || new Date().toLocaleDateString('sv-SE'),
+        sources: [],
+        done: tasks.map((t, i) => (t.completed_at ? i : -1)).filter((i) => i >= 0),
+      });
+    });
+
+    store.activeProjects = active;
+    globalThis.Storage?.write?.(store);
   });
 }
 
@@ -291,14 +335,18 @@ async function persistProject(project, duration) {
 
     const { data: row, error } = await Cloud.client
       .from('projects')
-      .insert({
+      .upsert({
         user_id: Cloud.userId,
         request_id: request?.id ?? null,
         title: project.title,
         category: knownCategory(project.category),
         duration,
         keywords: project.keywords || [],
-      })
+        // 화면이 쓰는 키·기간·시작일을 함께 남겨야 다른 기기에서 복원할 수 있다.
+        client_key: project.projectKey ?? null,
+        period: project.period ?? null,
+        started_on: new Date().toLocaleDateString('sv-SE'),
+      }, { onConflict: 'user_id,client_key' })
       .select('id')
       .single();
     if (error) throw error;
@@ -423,40 +471,56 @@ async function generateProjectViaAI({ category, duration, interests, likedTitles
  * 프로젝트 카드만 본다. 예전에 좋아요했던 주제는 여기 끼어들지 않는다.
  * 카드를 넘기는 동안 미리 만들어 두어, 설문 진입에서 기다리지 않게 한다.
  */
-async function prepareSurvey() {
-  if (!Cloud.ai || Cloud.surveyPending) return;
+/** 지금 카드·초점 조합을 나타내는 값. 이게 다르면 다른 설문이어야 한다. */
+function surveySignature() {
   const cards = currentRunCards();
-  const keywords = cards.map((c) => c.title);
-  if (!keywords.length) return;
+  const focus = globalThis.state?.decisionFocus || '';
+  return `${focus}::${cards.map((c) => c.title).join('|')}`;
+}
 
-  // 사용자가 "지금 가장 끌리는 주제"를 골랐으면 질문을 그 안으로 판다.
+function prepareSurvey() {
+  if (!Cloud.ai) return Promise.resolve();
+  const cards = currentRunCards();
+  if (!cards.length) return Promise.resolve();
+
+  const signature = surveySignature();
+  // 이미 이 조합으로 만들어 둔 설문이 있으면 그대로 쓴다.
+  if (Cloud.surveySignature === signature && Cloud.survey?.length) return Promise.resolve();
+  // 같은 조합의 요청이 진행 중이면 그 결과를 함께 기다린다.
+  if (Cloud.surveyRequest?.signature === signature) return Cloud.surveyRequest.promise;
+
   const focusCard = cards.find((c) => c.title === globalThis.state?.decisionFocus) || null;
-  // 후보 카드와 초점이 그대로면 이미 만든 설문을 다시 쓴다.
-  const signature = `${focusCard?.title || ''}::${keywords.join('|')}`;
-  if (Cloud.surveySignature === signature) return;
-
-  Cloud.surveyPending = true;
-  try {
-    const categories = [...new Set(cards.map((c) => c.category))];
+  const promise = (async () => {
     const data = await invoke('generate-survey', {
-      keywords,
-      categories,
+      keywords: cards.map((c) => c.title),
+      categories: [...new Set(cards.map((c) => c.category))],
       focus: focusCard?.title,
       focusIntro: focusCard?.intro,
     });
+    // 기다리는 사이 카드나 초점이 바뀌었으면 이 결과는 이미 남의 것이다. 버린다.
+    // (예전에는 이렇게 늦게 도착한 결과가 그대로 적용돼, 고른 적 없는 주제의
+    //  질문이 화면에 떴다.)
+    if (surveySignature() !== signature) return;
     if (data?.questions?.length) {
       Cloud.survey = data.questions;
       Cloud.surveySignature = signature;
     }
-  } finally {
+  })().finally(() => {
+    if (Cloud.surveyRequest?.signature === signature) Cloud.surveyRequest = null;
     Cloud.surveyPending = false;
-  }
+  });
+
+  Cloud.surveyRequest = { signature, promise };
+  Cloud.surveyPending = true;
+  return promise;
 }
 
 /** 생성된 설문을 프로토타입의 decisionQuestions 배열 형태로 바꿔 끼운다. */
 function applySurvey() {
   const target = globalThis.decisionQuestions;
   if (!Array.isArray(target) || !Cloud.survey?.length) return false;
+  // 지금 카드 조합으로 만든 설문이 아니면 쓰지 않는다. 기존 고정 문항이 낫다.
+  if (Cloud.surveySignature !== surveySignature()) return false;
   // 프로토타입은 각 항목이 [질문, 보기배열] 을 돌려주는 함수라고 가정한다.
   const built = Cloud.survey.map((item) => () => [item.q, item.options]);
   target.length = 0;
@@ -948,6 +1012,7 @@ function attach() {
       globalThis.state.decisionFocus = null;
       Cloud.survey = null;
       Cloud.surveySignature = null;
+      Cloud.surveyRequest = null; // 진행 중이던 예전 요청의 결과를 받지 않는다
 
       // 카드가 한 장뿐이면 고를 것이 없으므로 바로 그 카드를 초점으로 삼는다.
       if (cards.length === 1) {
@@ -1512,6 +1577,7 @@ function attach() {
         keywords: ai.keywords?.length ? ai.keywords : keywords,
         tasks: ai.tasks,
         projectKey: pick.key, // 완료 체크를 DB 행에 잇기 위한 키
+        period,
       }, PERIOD_TO_DURATION[period] || '1주');
       return [pick.key, ai.tasks.map((t) => t.content)];
     }));
