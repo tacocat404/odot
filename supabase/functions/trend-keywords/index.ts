@@ -72,6 +72,7 @@ Deno.serve(async (req: Request) => {
     seenKeywords?: string[];
     doneProjects?: string[];
     savedCards?: string[];
+    customInterests?: string[];
     count?: number;
   };
   try {
@@ -86,6 +87,8 @@ Deno.serve(async (req: Request) => {
   const seen = cleanInputs(payload.seenKeywords, 30, 40);
   const doneProjects = cleanInputs(payload.doneProjects, 60, 10);
   const savedCards = cleanInputs(payload.savedCards, 40, 12);
+  // '기타'에 손으로 적은 관심사. 분야가 정해져 있지 않으므로 여러 분야로 펼친다.
+  const customInterests = cleanInputs(payload.customInterests, 20, 5);
   const count = Math.min(Math.max(payload.count ?? 5, 1), 8);
 
   const trends = await fetchTrends();
@@ -98,13 +101,19 @@ Deno.serve(async (req: Request) => {
   const hasHistory = doneProjects.length > 0;
   const hasLiked = liked.length > 0 || savedCards.length > 0;
 
-  if (hasHistory) plan.push("나의 궤적", "나의 궤적");
+  // 사용자가 직접 적은 말이 가장 분명한 신호다. 그래서 맨 앞에 둔다.
+  if (customInterests.length) plan.push("직접 적은 관심사", "직접 적은 관심사");
+  if (hasHistory) plan.push("나의 궤적", customInterests.length ? "" : "나의 궤적");
   if (hasLiked) plan.push("취향 심화");
   if (trends.length) plan.push("실시간 트렌드");
   plan.push("넓히기");
+
+  const ordered = plan.filter(Boolean);
   // 남는 자리는 취향 심화 → 넓히기 순으로 메운다.
-  while (plan.length < count) plan.push(hasLiked ? "취향 심화" : "넓히기");
-  plan.length = count;
+  while (ordered.length < count) ordered.push(hasLiked ? "취향 심화" : "넓히기");
+  ordered.length = count;
+  plan.length = 0;
+  plan.push(...ordered);
 
   const planLines = plan
     .map((source, i) => `${i + 1}번 카드 — ${source}`)
@@ -132,11 +141,16 @@ Deno.serve(async (req: Request) => {
     "- 취향 심화 → 좋아요한 키워드나 관심 카드함에 보관 중인 카드보다 한 단계 깊거나 구체적인 키워드. reason: '좋아한 <키워드>에서 한 걸음 더'",
     "- 실시간 트렌드 → 지금 검색되는 말에서 배울 거리로 옮긴 것. reason: '실시간 트렌드 · <원본 검색어>'",
     "- 넓히기 → 아직 반응이 없던 분야에서 하나. reason: '아직 안 본 분야 · <분야>'",
+    "- 직접 적은 관심사 → 사용자가 '기타'에 손으로 적은 말에서 출발한다. 그 말은 분야가 정해져 있지 않으니,",
+    "  서로 다른 category 로 갈라서 만든다. 예를 들어 '우주'라고 적었으면 공부(천체물리)·교양(우주 탐사史)·",
+    "  진로(항공우주 직무)·독서(우주 에세이)처럼 분야를 달리해 뽑는다. 같은 분야로 몰지 않는다.",
+    "  reason: '직접 적은 <관심사> · <분야>로 넓히기'",
   ].join("\n");
 
   const user = [
     doneProjects.length ? `사용자가 끝낸 프로젝트: ${doneProjects.join(" / ")}` : "",
     savedCards.length ? `관심 카드함에 보관 중인 카드: ${savedCards.join(" / ")}` : "",
+    customInterests.length ? `사용자가 '기타'에 직접 적은 관심사: ${customInterests.join(", ")}` : "",
     interests.length ? `사용자가 고른 관심 분야: ${interests.join(", ")}` : "",
     liked.length ? `사용자가 좋아요한 키워드: ${liked.join(", ")}` : "",
     trends.length ? `지금 한국에서 실시간으로 많이 검색되는 말: ${trends.join(", ")}` : "",

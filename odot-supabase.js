@@ -40,6 +40,15 @@ const Cloud = {
     return globalThis.Storage?.read?.()?.interests || [];
   },
   /**
+   * '기타'에 직접 적은 관심사.
+   * 7개 카테고리 이름이 아닌 것은 사용자가 손으로 넣은 주제다.
+   * 이건 분야가 정해져 있지 않으므로, 카드 생성 때 여러 분야로 펼쳐 준다.
+   */
+  customInterests() {
+    const known = new Set((globalThis.Catalog?.categories || []).map((c) => c.name));
+    return (globalThis.Storage?.read?.()?.interests || []).filter((name) => !known.has(name));
+  },
+  /**
    * 끝낸 프로젝트 제목 (추천의 "나의 궤적" 소스).
    * 아카이브에 보관된 완료 프로젝트와, 할 일을 모두 끝낸 진행 프로젝트를 함께 본다.
    */
@@ -775,6 +784,7 @@ async function fetchKeywordCards(count) {
     seenKeywords: [...Cloud.keywordBySlug.values()].slice(-40),
     doneProjects: Cloud.doneProjects(),
     savedCards: Cloud.savedCards(),
+    customInterests: Cloud.customInterests(),
     count,
   });
   if (!data?.cards?.length) return [];
@@ -1545,6 +1555,7 @@ function attach() {
     // 목표와 마찬가지로, 할 일도 이번에 고른 카드에서만 나와야 한다.
     const runCards = currentRunCards();
     const keywords = runCards.map((c) => c.title);
+    const sourceByKey = {}; // 프로젝트별로 '실제로 쓰인 카드'를 담아 둔다
 
     // 할 일이 구체적으로 나오려면 재료가 필요하다.
     // 설문 답(쓸 수 있는 시간), 이 목표를 만든 카드의 설명, 실제 남은 일수를 함께 넘긴다.
@@ -1571,6 +1582,18 @@ function attach() {
         taskCount: 3,
       });
       if (!ai?.tasks?.length) return null;
+
+      /* 이 프로젝트를 실제로 만든 카드를 골라 둔다.
+         프로토타입은 같은 카테고리 카드를 전부 붙여서, '심리학' 목표에
+         '고체전해질' 카드가 출처로 뜨는 일이 있었다. 목표와 할 일 문장에
+         이름이 실제로 등장하는 카드만 남긴다. */
+      const madeFrom = `${pick.goal?.[0] || ''} ${ai.tasks.map((t) => t.content).join(' ')}`;
+      const used = cards.filter((c) => madeFrom.includes(c.title));
+      const focusInThisCategory = runCards.find((c) =>
+        c.title === globalThis.state?.decisionFocus && c.category === pick.category);
+      const sourceCards = used.length ? used : (focusInThisCategory ? [focusInThisCategory] : cards);
+      sourceByKey[pick.key] = sourceCards;
+
       await persistProject({
         title: pick.goal?.[0] || ai.title,
         category: pick.category,
@@ -1584,6 +1607,7 @@ function attach() {
 
     const data = Storage.read();
     data.aiTasks = data.aiTasks || {};
+    data.aiSourceCards = { ...(data.aiSourceCards || {}), ...sourceByKey };
     results.filter(Boolean).forEach(([key, tasks]) => { data.aiTasks[key] = tasks; });
     Storage.write(data);
   }
@@ -1766,8 +1790,12 @@ function attach() {
       const preview = project.querySelector('.project-origin-preview');
       if (!preview || preview.dataset.expandable) return;
 
-      let cards = [];
-      try { cards = JSON.parse(project.dataset.sourceCards || '[]'); } catch { cards = []; }
+      // 실제로 이 프로젝트를 만든 카드를 우선한다. 프로토타입이 dataset 에 넣어 두는
+      // 값은 같은 카테고리 카드를 전부 담고 있어 엉뚱한 카드가 섞인다.
+      let cards = Storage.read().aiSourceCards?.[project.dataset.projectKey] || [];
+      if (!cards.length) {
+        try { cards = JSON.parse(project.dataset.sourceCards || '[]'); } catch { cards = []; }
+      }
       if (!cards.length) return;
 
       preview.dataset.expandable = 'true';
