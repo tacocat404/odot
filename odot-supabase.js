@@ -181,7 +181,38 @@ async function hydrateFromCloud() {
 
     if (globalThis.state) globalThis.state.interests = store.interests;
     await hydrateProjects();
+    hydrateCardBox();
   });
+}
+
+/**
+ * 복원한 프로젝트를 화면에 실제로 그린다.
+ *
+ * 프로토타입은 페이지가 열릴 때 한 번 복원을 시도하는데, 그 시점에는 이 모듈이
+ * 아직 DB 에서 아무것도 가져오지 않았다. 그래서 내려받은 뒤 다시 그려 줘야 한다.
+ */
+function renderRestoredProjects() {
+  const store = globalThis.Storage?.read?.() || {};
+  if (!(store.activeProjects || []).length) return;
+  if (!globalThis.openDecisionProject || !globalThis.state) return;
+
+  // 복원은 화면을 가로채면 안 된다. 프로토타입의 복원 경로와 같은 방식으로 막는다.
+  const screen = document.querySelector('.screen.active')?.id;
+  const realShowScreen = globalThis.showScreen;
+  const realToast = globalThis.toast;
+  globalThis.showScreen = () => {};
+  globalThis.toast = () => {};
+  try {
+    globalThis.state.decisionGoalsSelected = [];
+    globalThis.openDecisionProject();
+  } catch (err) {
+    console.warn('[odot-cloud] 프로젝트 복원 실패', err?.message || err);
+  } finally {
+    globalThis.showScreen = realShowScreen;
+    globalThis.toast = realToast;
+  }
+  if (screen) realShowScreen?.(screen);
+  globalThis.syncProjectCandidates?.();
 }
 
 /**
@@ -192,38 +223,139 @@ async function hydrateFromCloud() {
  */
 async function hydrateProjects() {
   return safe('hydrateProjects', async () => {
-    const { data, error } = await Cloud.client
-      .from('projects')
-      .select('id, client_key, title, category, period, started_on, completed_at, tasks(id, content, position, completed_at), project_notes:tasks(id)')
-      .eq('user_id', Cloud.userId)
-      .not('client_key', 'is', null)
-      .order('created_at');
-    if (error) throw error;
-    if (!data?.length) return;
+    const [projectRes, noteRes] = await Promise.all([
+      Cloud.client
+        .from('projects')
+        .select('id, client_key, title, category, period, started_on, completed_at, keywords, tasks(id, content, position, suggested_when, completed_at)')
+        .eq('user_id', Cloud.userId)
+        .not('client_key', 'is', null)
+        .order('started_on'),
+      Cloud.client
+        .from('task_notes')
+        .select('note, noted_on, task_id')
+        .eq('user_id', Cloud.userId)
+        .order('noted_on'),
+    ]);
+    if (projectRes.error) throw projectRes.error;
+    const projects = projectRes.data || [];
+    if (!projects.length) return;
+
+    const notesByTask = new Map();
+    (noteRes.data || []).forEach((n) => {
+      if (!notesByTask.has(n.task_id)) notesByTask.set(n.task_id, []);
+      notesByTask.get(n.task_id).push(n);
+    });
 
     const store = globalThis.Storage?.read?.() || {};
-    const active = [];
     store.aiTasks = store.aiTasks || {};
     store.aiTaskIds = store.aiTaskIds || {};
+    const active = [];
+    const done = [];
+    const notes = [];
+    const checkins = [];
+    const sourceByKey = {};
 
-    data.filter((p) => !p.completed_at).forEach((project) => {
-      const tasks = (project.tasks || []).slice().sort((a, b) => a.position - b.position);
+    projects.forEach((project) => {
       const key = project.client_key;
+      const tasks = (project.tasks || []).slice().sort((a, b) => a.position - b.position);
       store.aiTasks[key] = tasks.map((t) => t.content);
       store.aiTaskIds[key] = tasks.map((t) => t.id);
+
+      // 오늘의 한 줄은 화면(taskNotes)과 연결 스트릭(checkins) 양쪽이 읽는다.
+      tasks.forEach((task, index) => {
+        (notesByTask.get(task.id) || []).forEach((n) => {
+          notes.push({ project: key, task: index, date: n.noted_on, note: n.note });
+          checkins.push({ project: key, date: n.noted_on, kind: 'task-note', note: n.note });
+        });
+      });
+
+      if (project.completed_at) {
+        // 아카이브와 밍밍이 색이 읽는 완료 프로젝트 형태로 되돌린다.
+        done.push({
+          id: `cloud:${project.id}`,
+          key,
+          category: project.category,
+          title: project.title,
+          period: project.period || '단기',
+          completedAt: String(project.completed_at).slice(0, 10),
+          milestones: tasks.map((task, i) => ({
+            order: i + 1,
+            title: task.content,
+            planned: task.suggested_when || '',
+            note: (notesByTask.get(task.id) || [])[0]?.note || '',
+            recordedAt: (notesByTask.get(task.id) || [])[0]?.noted_on
+              || String(task.completed_at || project.completed_at).slice(0, 10),
+          })),
+          dailyNotes: tasks.flatMap((task) =>
+            (notesByTask.get(task.id) || []).map((n) => ({ date: n.noted_on, note: n.note }))),
+          sourceCards: (project.keywords || []).map((word, i) => ({
+            id: `cloud-${project.id}-${i}`,
+            category: project.category,
+            title: word,
+            intro: '',
+            reason: `${project.category} · 이 프로젝트를 만든 카드`,
+          })),
+        });
+        return;
+      }
+
+      // 이 프로젝트를 만든 카드도 되살린다. 없으면 카드 목록이 빈 채로 뜬다.
+      const sources = (project.keywords || []).map((word, i) => ({
+        id: `cloud-${project.id}-${i}`,
+        category: project.category,
+        title: word,
+        intro: '',
+        reason: `${project.category} · 이 프로젝트를 만든 카드`,
+      }));
+      sourceByKey[key] = sources;
+
       active.push({
         key,
         category: project.category,
         goal: [project.title, project.period || '단기', 90],
         startedAt: project.started_on || new Date().toLocaleDateString('sv-SE'),
-        sources: [],
+        sources,
         done: tasks.map((t, i) => (t.completed_at ? i : -1)).filter((i) => i >= 0),
       });
     });
 
     store.activeProjects = active;
+    store.completedProjects = done;
+    store.taskNotes = notes;
+    store.checkins = checkins;
+    store.aiSourceCards = { ...(store.aiSourceCards || {}), ...sourceByKey };
     globalThis.Storage?.write?.(store);
   });
+}
+
+/**
+ * 좋아요한 카드를 관심 카드함으로 되살린다.
+ * 이미 프로젝트에 쓴 카드는 보관만(candidate false), 나머지는 후보로 둔다.
+ */
+function hydrateCardBox() {
+  const store = globalThis.Storage?.read?.() || {};
+  const liked = (store.reactions || []).filter((r) => r.type === 'like');
+  if (!liked.length) return;
+
+  const usedWords = new Set([
+    ...(store.completedProjects || []).flatMap((p) => (p.sourceCards || []).map((c) => c.title)),
+    ...(store.activeProjects || []).map((p) => p.goal?.[0] || ''),
+  ].join(' ').split(/\s+/).filter(Boolean));
+
+  const cards = liked.map((r) => {
+    const title = Cloud.keywordBySlug.get(r.topicId) || r.topicId;
+    return {
+      id: r.topicId,
+      category: r.category,
+      title,
+      intro: '',
+      reason: `${r.category} · 관심 카드`,
+      candidate: !usedWords.has(title),
+    };
+  });
+
+  store.cardStore = { version: store.cardStore?.version || 'interest-inbox-v1', cards };
+  globalThis.Storage?.write?.(store);
 }
 
 /** 전역 시드 카드의 slug → id 매핑을 미리 받아 둔다. */
@@ -2045,6 +2177,8 @@ function attach() {
 
   // 앱 재시작 시 프로젝트 복원은 이 모듈보다 먼저 끝난다.
   // 그 결과에도 할 일·출처 카드·조작 버튼을 똑같이 입힌다.
+  // DB 에서 내려받은 프로젝트를 화면에 그린 뒤, 할 일·출처 카드·조작 버튼을 입힌다.
+  renderRestoredProjects();
   applyStoredTasks();
   bindCompletionSync();
   showOriginCards();
