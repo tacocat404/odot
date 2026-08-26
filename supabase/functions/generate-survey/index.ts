@@ -1,5 +1,5 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { cleanInputs, isSafeOutput } from "../_shared/safety.ts";
+import { cleanInput, cleanInputs, isSafeOutput } from "../_shared/safety.ts";
 
 // F-URTMLV · 좋아요한 키워드로 분기 설문 문항 만들기
 //
@@ -35,7 +35,7 @@ Deno.serve(async (req: Request) => {
   const apiKey = Deno.env.get("OPENAI_API_KEY");
   if (!apiKey) return json({ error: "missing_openai_key" }, 503);
 
-  let payload: { keywords?: string[]; categories?: string[] };
+  let payload: { keywords?: string[]; categories?: string[]; focus?: string; focusIntro?: string };
   try {
     payload = await req.json();
   } catch {
@@ -44,6 +44,9 @@ Deno.serve(async (req: Request) => {
 
   const keywords = cleanInputs(payload.keywords, 30, 10);
   const categories = cleanInputs(payload.categories, 20, 5);
+  // 사용자가 "지금 가장 끌린다"고 직접 고른 주제. 있으면 질문을 여기로 파고든다.
+  const focus = cleanInput(payload.focus, 40);
+  const focusIntro = cleanInput(payload.focusIntro, 120) ?? "";
   if (!keywords.length) return json({ error: "no_keywords" }, 400);
 
   const system = [
@@ -56,18 +59,33 @@ Deno.serve(async (req: Request) => {
     "- 질문은 40자 이내, 보기는 각 15자 이내다.",
     "",
     "질문 구성:",
-    "- 키워드가 2개 이상이면 비교 질문을 최소 1개 넣는다. 예: '둘 중 지금 더 끌리는 쪽은?' 보기에 실제 키워드를 쓴다.",
-    "- 다음 두 축은 반드시 포함한다. 다만 문장은 사용자의 키워드에 맞게 다시 쓴다.",
+    focus
+      ? `- 사용자는 '${focus}'를 지금 가장 끌리는 주제로 직접 골랐다. 질문은 이 주제 안으로 파고든다.`
+      : "- 키워드가 2개 이상이면 비교 질문을 최소 1개 넣는다. 보기에 실제 키워드를 쓴다.",
+    focus
+      ? "- 이미 고른 주제를 다시 묻지 않는다. '무엇에 끌리나요' 같은 질문은 넣지 않는다."
+      : "",
+    focus
+      ? [
+        "- 다음 네 가지를 이 주제에 맞게 구체적으로 묻는다:",
+        `  · '${focus}' 안에서 어느 갈래가 더 궁금한지 (보기는 실제 세부 갈래 이름)`,
+        "  · 지금 어느 정도까지 아는지 (처음 → 익숙함 순서)",
+        "  · 어떤 방식으로 하고 싶은지 (읽기·보기·직접 해보기·기록하기 등 실제 방법)",
+        "  · 끝났을 때 무엇이 남으면 좋을지 (이 주제에서 실제로 남을 수 있는 것)",
+      ].join("\n")
+      : "",
+    "- 다음 두 축은 반드시 포함한다. 다만 문장은 주제에 맞게 다시 쓴다.",
     "  · 일주일에 쓸 수 있는 시간 (보기는 적은 시간 → 많은 시간 순서)",
-    "  · 중간에 멈추게 되는 이유",
-    "- 나머지는 키워드에 밀착한 질문으로 채운다. 어느 주제에나 붙는 일반적인 질문은 쓰지 않는다.",
+    "  · 중간에 멈추게 되는 이유 (보기는 이 주제에서 실제로 막힐 만한 지점)",
+    "- 어느 주제에나 붙는 일반적인 질문은 쓰지 않는다.",
     "- 6개 질문이 서로 같은 형식으로 시작하지 않게 한다.",
     "",
     "- 미성년자가 쓴다. 위험한 활동, 의료·투자 조언, 음주·흡연, 성인 주제, 외모·체중 평가는 절대 넣지 않는다.",
   ].join("\n");
 
   const user = [
-    `사용자가 좋아요한 키워드: ${keywords.join(", ")}`,
+    focus ? `지금 가장 끌리는 주제: ${focus}${focusIntro ? ` (${focusIntro})` : ""}` : "",
+    `이번 프로젝트 카드: ${keywords.join(", ")}`,
     categories.length ? `해당 분야: ${categories.join(", ")}` : "",
     "",
     `질문 ${QUESTION_COUNT}개를 만든다.`,

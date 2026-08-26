@@ -428,14 +428,22 @@ async function prepareSurvey() {
   const cards = currentRunCards();
   const keywords = cards.map((c) => c.title);
   if (!keywords.length) return;
-  // 후보 카드가 그대로면 이미 만든 설문을 다시 쓴다.
-  const signature = keywords.join('|');
+
+  // 사용자가 "지금 가장 끌리는 주제"를 골랐으면 질문을 그 안으로 판다.
+  const focusCard = cards.find((c) => c.title === globalThis.state?.decisionFocus) || null;
+  // 후보 카드와 초점이 그대로면 이미 만든 설문을 다시 쓴다.
+  const signature = `${focusCard?.title || ''}::${keywords.join('|')}`;
   if (Cloud.surveySignature === signature) return;
 
   Cloud.surveyPending = true;
   try {
     const categories = [...new Set(cards.map((c) => c.category))];
-    const data = await invoke('generate-survey', { keywords, categories });
+    const data = await invoke('generate-survey', {
+      keywords,
+      categories,
+      focus: focusCard?.title,
+      focusIntro: focusCard?.intro,
+    });
     if (data?.questions?.length) {
       Cloud.survey = data.questions;
       Cloud.surveySignature = signature;
@@ -845,21 +853,109 @@ function attach() {
     };
   }
 
+  /**
+   * 질문 찾기 1단계 — 주제 좁히기.
+   *
+   * 카드가 여러 장이면 곧바로 6문항으로 넘어가지 않고, 지금 가장 끌리는 주제를
+   * 하나 고르게 한다. 그 선택이 있어야 질문이 그 주제 안으로 파고들 수 있다.
+   * (예전에는 어느 주제에나 붙는 같은 질문 6개가 나왔다.)
+   */
+  function renderFocusStep(onPicked) {
+    const flow = document.querySelector('#decisionFlow');
+    const cards = currentRunCards();
+    if (!flow) return false;
+
+    globalThis.setDecisionMode?.(true);
+    flow.innerHTML = `
+      <div class="flow-top">
+        <button class="flow-back" id="focusBack" type="button" aria-label="발견으로 돌아가기">‹</button>
+        <span class="flow-step">주제 좁히기</span>
+      </div>
+      <div class="flow-card">
+        <p class="flow-kicker">고른 카드 ${cards.length}장</p>
+        <h2>지금 가장<br>끌리는 건 뭐예요?</h2>
+        <p class="sub">하나를 고르면 그 주제로 더 깊이 물어볼게요. 나머지는 관심 카드함에 그대로 있어요.</p>
+      </div>
+      <div class="focus-list">
+        ${cards.map((card, i) => `
+          <button class="focus-option" type="button" data-focus="${i}" aria-pressed="false">
+            <strong>${card.title}</strong>
+            ${card.intro ? `<span>${card.intro}</span>` : ''}
+            <small>${card.category}</small>
+          </button>`).join('')}
+      </div>
+      <button class="flow-primary" id="focusConfirm" type="button" disabled>주제를 골라 주세요</button>
+      <p class="flow-helper" id="focusHelper" role="status">고른 주제로 질문 6개를 만들어요.</p>`;
+
+    const confirm = flow.querySelector('#focusConfirm');
+    let picked = null;
+
+    flow.querySelectorAll('[data-focus]').forEach((button) => {
+      button.onclick = () => {
+        picked = cards[+button.dataset.focus];
+        flow.querySelectorAll('[data-focus]').forEach((other) => {
+          const on = other === button;
+          other.classList.toggle('selected', on);
+          other.setAttribute('aria-pressed', String(on));
+        });
+        confirm.disabled = false;
+        confirm.textContent = `‘${picked.title}’로 질문 받기`;
+        // 고르는 즉시 만들기 시작해, 버튼을 누를 땐 이미 준비돼 있게 한다.
+        globalThis.state.decisionFocus = picked.title;
+        prepareSurvey();
+      };
+    });
+
+    flow.querySelector('#focusBack').onclick = () => globalThis.setDecisionMode?.(false);
+    confirm.onclick = () => onPicked(picked);
+    return true;
+  }
+
+  const focusStyle = document.createElement('style');
+  focusStyle.textContent = `
+    .focus-list{display:flex;flex-direction:column;gap:9px;margin:14px 0 4px}
+    .focus-option{display:flex;flex-direction:column;gap:3px;align-items:flex-start;
+      padding:14px 15px;border:1px solid var(--line);border-radius:17px;background:#fff;
+      font:inherit;text-align:left;cursor:pointer;transition:border-color .15s,background .15s}
+    .focus-option.selected{border-color:var(--primary,#7152a6);
+      background:color-mix(in srgb,var(--primary,#7152a6) 7%,#fff)}
+    .focus-option strong{font-size:16px;letter-spacing:-.3px}
+    .focus-option span{color:var(--muted);font-size:12px;line-height:1.5}
+    .focus-option small{margin-top:2px;color:var(--primary,#7152a6);font-size:10.5px;font-weight:900}
+  `;
+  document.head.append(focusStyle);
+
   // 설문 시작 시점에 준비된 문항으로 갈아끼운다. 없으면 기존 고정 문항을 쓴다.
   const baseStartDecision = globalThis.startDecision;
   if (typeof baseStartDecision === 'function') {
-    globalThis.startDecision = async () => {
+    /** 주제를 정한 뒤 실제 설문으로 넘어간다. */
+    const runSurvey = async () => {
       if (Cloud.ai && !Cloud.survey && (globalThis.state?.decisionLikes || []).length) {
         const flow = document.querySelector('#decisionFlow');
         if (flow) {
           globalThis.setDecisionMode?.(true);
-          flow.innerHTML = `<div class="flow-card">${busyCardHTML('고른 키워드로 질문을 만드는 중')}</div>`;
+          flow.innerHTML = `<div class="flow-card">${busyCardHTML('고른 주제로 질문을 만드는 중')}</div>`;
           startBusyCopyRotation(flow);
         }
         await prepareSurvey();
       }
       applySurvey();
       baseStartDecision();
+    };
+
+    globalThis.startDecision = async () => {
+      const cards = currentRunCards();
+      globalThis.state.decisionFocus = null;
+      Cloud.survey = null;
+      Cloud.surveySignature = null;
+
+      // 카드가 한 장뿐이면 고를 것이 없으므로 바로 그 카드를 초점으로 삼는다.
+      if (cards.length === 1) {
+        globalThis.state.decisionFocus = cards[0].title;
+        return runSurvey();
+      }
+      if (cards.length > 1 && Cloud.ai && renderFocusStep(() => runSurvey())) return;
+      return runSurvey();
     };
     // 버튼은 원본 함수를 '값'으로 붙잡고 있어서 위 교체가 반영되지 않는다. 다시 연결한다.
     const startBtn = document.querySelector('#decisionStart');
@@ -1147,24 +1243,73 @@ function attach() {
 
   const deckCard = document.querySelector('#activeCard');
   if (deckCard) {
-    let down = null;
-    deckCard.addEventListener('pointerdown', (e) => { down = { x: e.clientX, y: e.clientY }; });
+    let down = null;      // 제스처 시작점
+    let last = null;      // 마지막 이동량 (취소될 때 쓰려고 들고 있는다)
+
+    const startDecisionFromSwipe = () => {
+      deckCard.style.transform = '';
+      if (!(globalThis.state?.decisionLikes || []).length) {
+        globalThis.toast?.('마음 가는 카드를 한 장 이상 골라주세요.');
+        return;
+      }
+      globalThis.startDecision?.();
+    };
+
+    /** 카드 너비에 맞춘 확정 거리. 작은 화면에서 95px 은 화면의 4분의 1이 넘는다. */
+    const commitDistance = () =>
+      Math.max(56, Math.min(95, deckCard.getBoundingClientRect().width * 0.22));
+
+    deckCard.addEventListener('pointerdown', (e) => {
+      down = { x: e.clientX, y: e.clientY };
+      last = { dx: 0, dy: 0 };
+    });
+    deckCard.addEventListener('pointermove', (e) => {
+      if (down) last = { dx: e.clientX - down.x, dy: e.clientY - down.y };
+    });
+
     deckCard.addEventListener('pointerup', (e) => {
       if (!down) return;
-      const dx = e.clientX - down.x;
       const dy = e.clientY - down.y;
+      const dx = e.clientX - down.x;
       down = null;
+      last = null;
       // 좌우/위는 프로토타입의 기존 핸들러가 처리한다. 아래만 여기서 맡는다.
-      if (dy > 100 && Math.abs(dx) < 80) {
-        deckCard.style.transform = '';
-        if (!(globalThis.state?.decisionLikes || []).length) {
-          globalThis.toast?.('마음 가는 카드를 한 장 이상 골라주세요.');
-          return;
-        }
-        globalThis.startDecision?.();
-      }
+      if (dy > 100 && Math.abs(dx) < 80) startDecisionFromSwipe();
     });
+
+    /**
+     * 실제 휴대폰에서 카드가 안 넘어가던 원인.
+     *
+     * 프로토타입은 pointerup 에서만 스와이프를 확정한다. 그런데 폰에서는
+     * 브라우저가 포인터를 가로채는 일이 잦다 — 화면 가장자리에서 시작한
+     * 가로 스와이프는 '뒤로 가기' 제스처가 되고, 그때 pointerup 대신
+     * pointercancel 이 온다. 그러면 state.drag 가 남은 채 아무 일도 일어나지 않는다.
+     * 취소된 제스처도 충분히 밀었으면 그대로 확정한다.
+     */
+    const finishCancelled = () => {
+      if (!down || !last) { down = null; last = null; return; }
+      const { dx, dy } = last;
+      down = null;
+      last = null;
+      if (globalThis.state) globalThis.state.drag = null; // 기존 핸들러가 뒤늦게 처리하지 않도록
+
+      if (dy > 100 && Math.abs(dx) < 80) { startDecisionFromSwipe(); return; }
+      if (dy < -100 && Math.abs(dx) < 80) { globalThis.openSheet?.('#summarySheet'); return; }
+      if (Math.abs(dx) >= commitDistance()) { globalThis.react?.(dx > 0 ? 'like' : 'pass'); return; }
+      deckCard.style.transform = '';
+    };
+    deckCard.addEventListener('pointercancel', finishCancelled);
+    deckCard.addEventListener('lostpointercapture', finishCancelled);
   }
+
+  // 브라우저의 가로 당김(뒤로 가기)이 카드 스와이프를 채가지 않게 한다.
+  const swipeStyle = document.createElement('style');
+  swipeStyle.textContent = `
+    html,body{overscroll-behavior:none}
+    .app{overscroll-behavior-x:none}
+    .deck,#activeCard{touch-action:none}
+  `;
+  document.head.append(swipeStyle);
 
   // 키보드만으로도 카드에 반응할 수 있게 한다(버튼을 없앤 대신).
   document.addEventListener('keydown', (event) => {
@@ -1248,12 +1393,19 @@ function attach() {
       }
 
       const runCards = currentRunCards();
+      // 주제 좁히기에서 고른 카드를 맨 앞으로 보내, 목표도 그 주제를 먼저 다루게 한다.
+      const focusTitle = globalThis.state?.decisionFocus;
+      const orderedCards = focusTitle
+        ? [...runCards].sort((a, b) =>
+          Number(b.title === focusTitle) - Number(a.title === focusTitle))
+        : runCards;
+
       const goals = Cloud.ai
         ? await generateGoalsViaAI({
           categories,
           // 이번에 고른 카드만 넘긴다. 과거 좋아요 이력은 넘기지 않는다.
-          keywords: runCards.map((c) => c.title),
-          cards: runCards,
+          keywords: orderedCards.map((c) => c.title),
+          cards: orderedCards,
           survey: surveyAnswers(),
         })
         : null;
