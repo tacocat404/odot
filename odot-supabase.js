@@ -2604,14 +2604,25 @@ function attach() {
     const addDay = (date, category, amount) => {
       if (!date || !amount) return;
       const key = String(date).slice(0, 10);
-      const entry = byDay.get(key) || { likes: 0, completed: 0, category: '기타' };
-      if (category) entry.category = knownCategory(category);
-      if (amount.likes) entry.likes += amount.likes;
+      const entry = byDay.get(key) || {
+        likes: 0, completed: 0, category: '기타', categoryCounts: new Map(), dominantCount: 0,
+      };
+      const safeCategory = category ? knownCategory(category) : null;
+      if (amount.likes) {
+        entry.likes += amount.likes;
+        if (safeCategory) entry.categoryCounts.set(safeCategory, (entry.categoryCounts.get(safeCategory) || 0) + amount.likes);
+      }
       if (amount.completed) entry.completed += amount.completed;
       byDay.set(key, entry);
     };
     reactions.forEach((row) => addDay(new Date(row.created_at).toLocaleDateString('sv-SE'), row.category, { likes: 1 }));
     completions.forEach((row) => addDay(row.day, row.category, { completed: Number(row.completed_count) || 0 }));
+    byDay.forEach((entry) => {
+      const [category, count] = [...entry.categoryCounts.entries()]
+        .sort((a, b) => b[1] - a[1])[0] || ['기타', 0];
+      entry.category = category;
+      entry.dominantCount = count;
+    });
 
     if (!ranked.length && !completions.length) {
       root.innerHTML = `<p class="eyebrow">${today.getFullYear()}년 ${today.getMonth() + 1}월 · 내 인사이트</p>`
@@ -2628,6 +2639,7 @@ function attach() {
       date.setDate(mapStart.getDate() + index);
       return insightDate(date);
     });
+    const maxCardsPerDay = Math.max(1, ...mapDays.map((date) => byDay.get(date)?.likes || 0));
     const weekDays = thisWeekDays();
     const maxWeek = Math.max(1, ...weekDays.map((date) => {
       const item = byDay.get(date);
@@ -2643,18 +2655,47 @@ function attach() {
         const percent = Math.round((item.count / Math.max(totalLikes, 1)) * 100);
         return `<article class="stat-tile" style="--tile-wash:color-mix(in srgb,var(--${visual.color}) 25%,white)"><span class="stat-name">${item.category}</span><strong>${percent}%</strong></article>`;
       }).join('')}</div>`
-      + `<div class="chart-card" style="--heat:var(--${leadVisual.color})"><h3>최근 4주 활동 맵</h3><p>카드를 고르거나 할 일을 완료한 날이에요.</p><div class="heatmap" aria-label="최근 4주 실제 활동 맵">${mapDays.map((date) => {
+      + `<div class="chart-card insight-grass-card"><h3>최근 4주 카드 추가 맵</h3><p>그날 가장 많이 추가한 카드 분야의 색이에요.</p><div class="heatmap live-activity-map" aria-label="최근 4주 카드 추가 맵">${mapDays.map((date) => {
         const item = byDay.get(date);
-        const amount = (item?.likes || 0) + (item?.completed || 0);
-        return `<i data-level="${Math.min(amount, 4)}" title="${date}: ${amount}건" aria-label="${date}: ${amount}건"></i>`;
-      }).join('')}</div><div class="chart-legend"><span>적게</span><i></i><span>많이</span></div></div>`
+        const count = item?.likes || 0;
+        const level = count ? Math.max(1, Math.ceil((count / maxCardsPerDay) * 4)) : 0;
+        const visual = (Catalog.categories || []).find((category) => category.name === item?.category)
+          || leadVisual;
+        const detail = count
+          ? `${date} · ${item.category} 카드 ${item.dominantCount}장 (하루 총 ${count}장 추가)`
+          : `${date} · 추가한 카드 없음`;
+        return `<button class="insight-grass" type="button" data-insight-day data-detail="${detail}" data-level="${level}" style="--grass:var(--${visual.color})" aria-pressed="false" aria-label="${detail}" title="${detail}"></button>`;
+      }).join('')}</div><p class="insight-grass-detail" role="status" aria-live="polite">날짜를 누르면 그날의 카드 추가 기록을 보여 드려요.</p><div class="chart-legend"><span>적게</span><i></i><span>많이</span></div></div>`
       + `<div class="chart-card" style="--heat:var(--${leadVisual.color})"><h3>이번 주 활동</h3><p>카드 선택과 완료 행동을 합쳐 보여 줘요.</p><div class="weekly-bars">${weekDays.map((date, index) => {
         const item = byDay.get(date);
         const amount = (item?.likes || 0) + (item?.completed || 0);
         return `<div class="weekly-bar ${amount === maxWeek && amount > 0 ? 'active' : ''}"><b>${amount}</b><i style="height:${(amount / maxWeek) * 86}%"></i><span>${weekLabels[index]}</span></div>`;
       }).join('')}</div></div></section>`;
+    root.querySelectorAll('[data-insight-day]').forEach((button) => {
+      button.onclick = () => {
+        root.querySelector('.insight-grass-detail').textContent = button.dataset.detail;
+        root.querySelectorAll('[data-insight-day]').forEach((item) => item.setAttribute('aria-pressed', String(item === button)));
+      };
+    });
     scaleShareNumbers();
   }
+
+  const liveInsightMapStyle = document.createElement('style');
+  liveInsightMapStyle.textContent = `
+    .insight-grass-card{--grass-empty:#eee9e1}
+    .live-activity-map{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:6px;margin-top:15px}
+    .live-activity-map .insight-grass{aspect-ratio:1;min-width:0;border:0;border-radius:8px;background:var(--grass-empty);box-shadow:inset 0 1px #fff9,inset 0 -2px #cfc7bb55;cursor:pointer;transition:transform .14s ease,box-shadow .14s ease;touch-action:manipulation}
+    .live-activity-map .insight-grass[data-level="1"]{background:color-mix(in srgb,var(--grass) 32%,#fff);box-shadow:inset 0 1px #fff9,inset 0 -3px color-mix(in srgb,var(--grass) 48%,#0002),0 2px 4px #38281a12}
+    .live-activity-map .insight-grass[data-level="2"]{background:color-mix(in srgb,var(--grass) 56%,#fff);box-shadow:inset 0 1px #fff9,inset 0 -3px color-mix(in srgb,var(--grass) 64%,#0002),0 3px 5px #38281a14}
+    .live-activity-map .insight-grass[data-level="3"]{background:color-mix(in srgb,var(--grass) 76%,#fff);box-shadow:inset 0 1px #fff8,inset 0 -4px color-mix(in srgb,var(--grass) 72%,#0003),0 4px 7px #38281a18}
+    .live-activity-map .insight-grass[data-level="4"]{background:var(--grass);box-shadow:inset 0 1px #fff7,inset 0 -4px color-mix(in srgb,var(--grass) 78%,#0004),0 5px 8px #38281a1c}
+    .live-activity-map .insight-grass:active{transform:translateY(2px);box-shadow:inset 0 1px #fff7,inset 0 -1px #0002}
+    .live-activity-map .insight-grass[aria-pressed="true"]{outline:2px solid var(--ink);outline-offset:2px}
+    .live-activity-map .insight-grass:focus-visible{outline:3px solid var(--primary);outline-offset:2px}
+    .insight-grass-detail{min-height:18px;margin:11px 0 0;color:var(--muted);font-size:10px;font-weight:800;line-height:1.45}
+    @media(prefers-reduced-motion:reduce){.live-activity-map .insight-grass{transition:none}}
+  `;
+  document.head.append(liveInsightMapStyle);
 
   let insightRefreshTimer;
   function refreshLiveInsights() {
