@@ -1437,6 +1437,48 @@ function attach() {
     if (value) value.textContent = `${count}일`;
   }
 
+  /**
+   * 카드 조작 버튼을 없앤 뒤, 처음 보는 사람도 네 방향의 결과를 미리 알 수 있도록
+   * 소개 화면의 두 번째 장을 실제 제스처와 같은 언어로 바꾼다. 원본 HTML은 렌더
+   * 기반이라 건드리지 않고 여기서만 증강한다.
+   */
+  function installOnboardingGestureGuide() {
+    const slide = document.querySelectorAll('.onboard-slide')[1];
+    if (!slide || slide.dataset.gestureGuideInstalled) return;
+    slide.dataset.gestureGuideInstalled = 'true';
+
+    const scene = slide.querySelector('.intro-scene');
+    const title = slide.querySelector('h1');
+    const copy = slide.querySelector('.sub');
+    if (!scene || !title || !copy) return;
+
+    scene.classList.add('scene-gesture-guide');
+    scene.innerHTML = `
+      <span class="gesture-direction gesture-up"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 19V5m0 0-5 5m5-5 5 5"/></svg>위 · 요약</span>
+      <span class="gesture-direction gesture-left"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 12H5m0 0 5-5m-5 5 5 5"/></svg>왼쪽 · 패스</span>
+      <img src="assets/category-music.png" alt="" aria-hidden="true">
+      <span class="gesture-direction gesture-right">오른쪽 · 관심<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m0 0-5-5m5 5-5 5"/></svg></span>
+      <span class="gesture-direction gesture-down">아래 · 질문 찾기<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 5v14m0 0-5-5m5 5 5-5"/></svg></span>`;
+    title.innerHTML = '카드를 밀어<br>마음을 알려주세요.';
+    copy.textContent = '방향마다 카드의 다음 단계가 달라져요.';
+
+    const style = document.createElement('style');
+    style.textContent = `
+      .scene-gesture-guide{isolation:isolate;background:#e5edf8}
+      .scene-gesture-guide>img{position:absolute;z-index:1;left:50%;bottom:13px;width:175px;height:175px;transform:translateX(-50%);animation:focusFloat 3s ease-in-out infinite}
+      .gesture-direction{position:absolute;z-index:2;display:flex;align-items:center;gap:4px;padding:7px 9px;border:1px solid #ffffffcc;border-radius:999px;background:#fffc;color:#47423c;box-shadow:0 5px 12px #3e34251a;font-size:11px;font-weight:900;line-height:1;white-space:nowrap}
+      .gesture-direction svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round}
+      .gesture-up{top:21px;left:50%;transform:translateX(-50%);color:#527dac}
+      .gesture-left{top:50%;left:12px;transform:translateY(-50%);color:#dc4650}
+      .gesture-right{top:50%;right:12px;transform:translateY(-50%);color:#408b6e}
+      .gesture-down{bottom:21px;left:50%;transform:translateX(-50%);color:#6e34cc}
+      @media (prefers-reduced-motion:reduce){.scene-gesture-guide>img{animation:none}}
+    `;
+    document.head.append(style);
+  }
+
+  installOnboardingGestureGuide();
+
   /* ── C-2 · 조작을 스와이프로 통일 ─────────────────────────────
      하단 하트·X·정보 버튼과 질문 찾기 버튼은 스와이프와 같은 일을 중복으로 하고
      있었다. 버튼을 걷어내고 비어 있던 아래 방향을 질문 찾기에 연결한다.
