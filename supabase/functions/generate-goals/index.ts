@@ -173,7 +173,11 @@ Deno.serve(async (req: Request) => {
       .map((item, i): [string, string, number] | null => {
         const title = String(item?.title ?? "").trim().slice(0, 40);
         if (!title) return null;
-        if (!sourceTitles.has(String(item?.source_card ?? "").trim())) return null;
+        // 모델이 source_card 를 생략하는 경우가 있다. 현재 흐름은 프로젝트 카드
+        // 한 장만 허용하므로, 생략됐다면 그 유일한 카드를 근거로 확정해도 다른
+        // 관심 카드가 섞일 여지가 없다. 이름을 보냈는데 다른 카드면 여전히 거절한다.
+        const sourceCard = String(item?.source_card ?? "").trim();
+        if (sourceCard && !sourceTitles.has(sourceCard)) return null;
         if (!isSafeOutput(title)) { console.warn("blocked_goal", title); return null; }
         const period = PERIODS.includes(String(item?.period))
           ? String(item.period)
