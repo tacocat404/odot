@@ -845,21 +845,61 @@ function busyCardHTML(detail) {
  * 보여 준다. 기다리는 이유와 다음에 일어날 일을 알 수 있게 하는 안내다.
  */
 function agentProgressHTML(detail, steps) {
-  const labels = Array.isArray(steps) ? steps.filter(Boolean).slice(0, 3) : [];
-  if (!labels.length) return busyCardHTML(detail);
-  return `${busyCardHTML(detail)}<ol class="odot-agent-progress" aria-label="생성 진행 단계">${labels
-    .map((label, index) => `<li class="${index === 0 ? 'is-active' : ''}"><span>${index + 1}</span>${label}</li>`)
+  const items = Array.isArray(steps) ? steps.filter(Boolean).slice(0, 3).map((step) => (
+    typeof step === 'string' ? { label: step, live: `${step} 중이에요.` } : step
+  )) : [];
+  if (!items.length) return busyCardHTML(detail);
+  return `${busyCardHTML(detail)}<p class="odot-agent-live" role="status" aria-live="polite"><i aria-hidden="true"></i><span>${items[0].live}</span></p><ol class="odot-agent-progress" aria-label="생성 진행 단계">${items
+    .map((item, index) => `<li class="${index === 0 ? 'is-active' : ''}" data-live="${item.live}"><span aria-hidden="true">${index + 1}</span>${item.label}</li>`)
     .join('')}</ol>`;
 }
 
-/** 3초 넘게 걸리면 문구를 한 번 바꿔 멈춘 게 아님을 알린다. */
+/**
+ * 실제 요청의 앞·뒤 단계에 맞춰 진행 표시를 갱신한다.
+ * 모델의 비공개 추론을 흉내 내지 않고, 카드 확인·답변 반영·결과 검증처럼
+ * 사용자에게 확인 가능한 처리만 짧은 작업 로그로 안내한다.
+ */
 function startBusyCopyRotation(root) {
   const detail = root?.querySelector('.odot-busy-detail');
   if (!detail) return;
   clearTimeout(root._busyTimer);
+  const rows = [...root.querySelectorAll('.odot-agent-progress li')];
+  const live = root.querySelector('.odot-agent-live span');
+  if (rows.length) {
+    let active = 0;
+    const activate = (index, complete = false) => {
+      active = index;
+      rows.forEach((row, rowIndex) => {
+        row.classList.toggle('is-active', rowIndex === index && !complete);
+        row.classList.toggle('is-complete', rowIndex < index || (complete && rowIndex === index));
+        const number = row.querySelector('span');
+        if (number) number.textContent = rowIndex < index || (complete && rowIndex === index) ? '✓' : String(rowIndex + 1);
+      });
+      if (live) live.textContent = rows[index]?.dataset.live || '';
+    };
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const secondStepTimer = setTimeout(() => activate(Math.min(1, rows.length - 1)), 420);
+    root._busyTimer = secondStepTimer;
+    return {
+      async finish() {
+        clearTimeout(secondStepTimer);
+        // 아주 빨리 끝나도 1 → 2 → 3의 흐름을 읽을 수 있게 짧게만 유지한다.
+        if (active < 1 && rows.length > 1) {
+          await wait(220);
+          activate(1);
+        }
+        if (rows.length > 2) {
+          await wait(240);
+          activate(2, true);
+        } else activate(active, true);
+      },
+      stop() { clearTimeout(secondStepTimer); },
+    };
+  }
   root._busyTimer = setTimeout(() => {
     if (detail.isConnected) detail.textContent = '조금만 더 기다려 주세요';
   }, 3000);
+  return null;
 }
 
 /** 뒤 카드에 남은 장수를 은은하게 표시한다(화면을 막지 않는다). */
@@ -884,6 +924,10 @@ function installBusyStyles() {
     .odot-agent-progress li span{display:grid;place-items:center;width:18px;height:18px;border-radius:50%;background:#f0ebf8;color:#76658b;font-size:10px}
     .odot-agent-progress li.is-active{color:var(--ink);font-weight:900}
     .odot-agent-progress li.is-active span{background:var(--primary,#7152a6);color:#fff;box-shadow:0 0 0 4px color-mix(in srgb,var(--primary,#7152a6) 12%,transparent)}
+    .odot-agent-progress li.is-complete{color:#5d467d}
+    .odot-agent-progress li.is-complete span{background:#e9ddfa;color:#623ca0}
+    .odot-agent-live{display:flex;align-items:center;justify-content:center;gap:6px;min-height:20px;margin:0 0 10px;color:#604487;font-size:11px;font-weight:800}
+    .odot-agent-live i{width:6px;height:6px;border-radius:50%;background:var(--primary,#7152a6);animation:odotBusyPulse 1.25s ease-in-out infinite}
     @keyframes odotBusyPulse{0%,100%{transform:scale(.82);opacity:.55}50%{transform:scale(1);opacity:1}}
     .odot-buffer-hint{display:inline-flex;align-items:center;gap:6px;margin-left:8px;
       color:var(--muted);font-size:11px;font-weight:800}
@@ -1308,16 +1352,20 @@ function attach() {
   if (typeof baseStartDecision === 'function') {
     /** 주제를 정한 뒤 실제 설문으로 넘어간다. */
     const runSurvey = async () => {
+      let progress;
       if (Cloud.ai && !Cloud.survey && (globalThis.state?.decisionLikes || []).length) {
         const flow = document.querySelector('#decisionFlow');
         if (flow) {
           globalThis.setDecisionMode?.(true);
           flow.innerHTML = `<div class="flow-card">${agentProgressHTML('고른 주제로 질문을 만드는 중', [
-            '선택 카드 확인', '관심 방향 정리', '질문 구성',
+            { label: '선택 카드 확인', live: '선택한 카드에서 핵심 주제를 읽고 있어요.' },
+            { label: '관심 방향 정리', live: '카드에 담긴 관심의 방향을 정리하고 있어요.' },
+            { label: '질문 구성', live: '답하기 쉬운 질문으로 다듬고 있어요.' },
           ])}</div>`;
-          startBusyCopyRotation(flow);
+          progress = startBusyCopyRotation(flow);
         }
         await prepareSurvey();
+        await progress?.finish();
       }
       applySurvey();
       baseStartDecision();
@@ -1843,12 +1891,15 @@ function attach() {
         return;
       }
 
+      let progress;
       const flow = document.querySelector('#decisionFlow');
       if (flow) {
         flow.innerHTML = `<div class="flow-card">${agentProgressHTML('답변에 맞는 목표를 고르는 중', [
-          '선택 카드 확인', '설문 답 반영', '목표 후보 정리',
+          { label: '선택 카드 확인', live: '이번 프로젝트 카드의 주제와 범위를 확인하고 있어요.' },
+          { label: '설문 답 반영', live: '쓸 수 있는 시간과 선호를 목표에 반영하고 있어요.' },
+          { label: '목표 후보 정리', live: '지금 시작할 수 있는 목표인지 마지막으로 확인하고 있어요.' },
         ])}</div>`;
-        startBusyCopyRotation(flow);
+        progress = startBusyCopyRotation(flow);
       }
 
       const runCards = currentRunCards();
@@ -1873,9 +1924,11 @@ function attach() {
         Object.keys(goals || {}).filter((c) => Array.isArray(goals[c]) && goals[c].length),
       );
       if (!covered.size) {
+        progress?.stop();
         showGoalTrouble('목표를 만들지 못했어요.', true);
         return;
       }
+      await progress?.finish();
       Object.assign(decisionGoals, goals);
 
       // 목표가 만들어진 카테고리만 그린다. 빠진 카테고리를 그대로 넘기면
@@ -1963,15 +2016,19 @@ function attach() {
       const label = confirm.textContent;
       confirm.disabled = true;
       confirm.textContent = '밍밍이가 할 일을 만드는 중…';
+      let progress;
       const flow = document.querySelector('#decisionFlow');
       if (flow) {
         flow.innerHTML = `<div class="flow-card">${agentProgressHTML('선택한 목표를 실행 계획으로 바꾸는 중', [
-          '프로젝트 목적 확인', '실행 단계 구성', '계획 검증',
+          { label: '프로젝트 목적 확인', live: '선택한 목표가 이루려는 변화를 확인하고 있어요.' },
+          { label: '실행 단계 구성', live: '기간과 가능한 시간을 기준으로 행동을 나누고 있어요.' },
+          { label: '계획 검증', live: '각 단계가 목표와 자연스럽게 이어지는지 점검하고 있어요.' },
         ])}</div>`;
-        startBusyCopyRotation(flow);
+        progress = startBusyCopyRotation(flow);
       }
       try {
         await buildTasksFor(picks);
+        await progress?.finish();
       } finally {
         confirm.disabled = false;
         confirm.textContent = label;
