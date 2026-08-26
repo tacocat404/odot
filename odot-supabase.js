@@ -342,6 +342,11 @@ async function hydrateProjects() {
  */
 function hydrateCardBox() {
   const store = globalThis.Storage?.read?.() || {};
+  // 카드함이 한 번이라도 저장됐다면(빈 목록 포함) 사용자가 직접 정리한 상태다.
+  // 좋아요 반응은 통계와 다음 추천을 위한 이력일 뿐, 새로고침 때 관심 카드로
+  // 되살릴 근거가 아니다. 이 조건이 없으면 '전체 비우기' 직후 모든 좋아요가
+  // 다시 카드함에 생긴다.
+  if (store.cardStore?.version === 'interest-inbox-v1') return;
   const liked = (store.reactions || []).filter((r) => r.type === 'like');
   if (!liked.length) return;
 
