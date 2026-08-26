@@ -16,12 +16,12 @@ const CATEGORIES = ["운동", "공부", "독서", "음악", "교양", "진로", 
 // 이 모델은 커스텀 temperature 를 지원하지 않는다(기본값 1만 허용) — 절대 temperature 를 보내지 않는다.
 const DEFAULT_MODEL = "gpt-5.6-luna";
 
-const TASK_COUNT: Record<string, number> = {
-  "1일": 3,
-  "1주": 3,
-  "1개월": 4,
-  "3개월": 5,
-  "6개월": 6,
+const TASK_RANGES: Record<string, readonly [number, number]> = {
+  "1일": [2, 3],
+  "1주": [4, 6],
+  "1개월": [6, 10],
+  "3개월": [10, 16],
+  "6개월": [14, 20],
 };
 
 function json(body: unknown, status = 200) {
@@ -42,7 +42,6 @@ Deno.serve(async (req: Request) => {
     duration?: string;
     category?: string;
     goal?: string;
-    taskCount?: number;
     survey?: { q?: string; a?: string }[];
     cards?: { title?: string; intro?: string }[];
     days?: number;
@@ -53,7 +52,7 @@ Deno.serve(async (req: Request) => {
     return json({ error: "invalid_json" }, 400);
   }
 
-  const duration = TASK_COUNT[payload.duration ?? ""] ? payload.duration! : "1주";
+  const duration = TASK_RANGES[payload.duration ?? ""] ? payload.duration! : "1주";
   const category = CATEGORIES.includes(payload.category ?? "")
     ? payload.category!
     : "기타";
@@ -67,21 +66,21 @@ Deno.serve(async (req: Request) => {
   const cards = (payload.cards ?? [])
     .map((c) => ({ title: cleanInput(c?.title, 40), intro: cleanInput(c?.intro, 120) }))
     .filter((c): c is { title: string; intro: string } => Boolean(c.title))
-    .slice(0, 5);
-  if (!cards.length) return json({ error: "no_project_cards" }, 400);
+    .slice(0, 2);
+  // 프로젝트는 선택한 카드 한 장의 주제를 깊게 푸는 흐름이다.
+  if (cards.length !== 1) return json({ error: "exactly_one_project_card_required" }, 400);
   const days = Number.isFinite(payload.days) ? Math.min(Math.max(Number(payload.days), 1), 400) : null;
-  // 호출자가 개수를 지정할 수 있다. 프로젝트 카드의 단계 수와 정확히 맞춰야 하기 때문이다.
-  const taskCount = Number.isInteger(payload.taskCount)
-    ? Math.min(Math.max(payload.taskCount!, 1), 8)
-    : TASK_COUNT[duration];
+  const [minTasks, maxTasks] = TASK_RANGES[duration];
 
   const system = [
     "너는 한국의 중학생·고등학생·대학생·취업준비생을 돕는 ODOT의 프로젝트 코치다.",
-    "사용자가 관심을 보인 주제를 바탕으로, 정해진 기간 안에 실제로 끝낼 수 있는 작은 프로젝트 하나와 할 일 목록을 만든다.",
+    "사용자가 선택한 프로젝트 카드 한 장을 바탕으로, 정해진 기간 안에 실제로 끝낼 수 있는 작은 프로젝트 하나와 할 일 목록을 만든다.",
     "",
     "규칙:",
     "- 반드시 한국어로 쓴다. 초등학생도 이해할 수 있는 쉬운 문장을 쓴다.",
     "- 할 일은 실행 순서대로 배열하고, 각 항목은 한 문장(40자 이내)으로 쓴다.",
+    "- 기간, 설문에서 드러난 시간·선호·중단 이유, 프로젝트 난이도를 보고 필요한 단계 수를 스스로 정한다.",
+    "- 단계 수를 적게 만들려고 핵심 과정을 합치거나, 많게 만들려고 의미 없는 쪼개기를 하지 않는다.",
     "",
     "구체적으로 쓰는 규칙(가장 중요):",
     "- 각 할 일에는 '무엇을'이 반드시 들어간다. 대상을 이름으로 부른다. '자료를 찾는다'가 아니라 '누리호 발사 영상 2편을 고른다'.",
@@ -90,9 +89,10 @@ Deno.serve(async (req: Request) => {
     "- 첫 할 일은 앉은 자리에서 30분 안에 끝낼 수 있어야 한다. 시작 문턱을 낮춘다.",
     "- 사용자가 쓸 수 있다고 답한 시간을 넘지 않게 분량을 정한다.",
     "- '이 프로젝트를 만든 카드'가 주어지면 그 카드의 주제를 할 일 안에서 실제로 다룬다.",
+    "- 카드에 없는 다른 주제·기술·교과 개념을 핵심 할 일로 끌어오지 않는다.",
     "",
     "문장이 서로 닮지 않게 하는 규칙(중요):",
-    "- 단계마다 역할이 다르다. 준비 → 실행 → 점검 → 남기기 순서를 따르되, 매번 같은 틀로 쓰지 않는다.",
+    "- 단계마다 역할이 다르다. 준비 → 이해/연습 → 적용 → 점검 → 남기기 순서를 프로젝트에 맞게 쓴다.",
     "- 서술어를 반복하지 않는다. 모든 항목이 '~를 고른다 / ~한다 / ~를 정리한다'로 끝나면 안 된다.",
     "- 주제 명사를 매 문장 되풀이하지 않는다. 첫 항목에서 밝혔으면 이후에는 생략하거나 다르게 부른다.",
     "- 마지막 항목도 이 프로젝트에서만 말이 되는 내용이어야 한다. '마감 전 점검하기' 같은 어느 프로젝트에나 붙는 문장은 쓰지 않는다.",
@@ -115,9 +115,10 @@ Deno.serve(async (req: Request) => {
       ? ["설문 답변:", ...survey.map((item) => `- ${item.q} → ${item.a}`)].join("\n")
       : "",
     "",
-    `할 일은 정확히 ${taskCount}개 만든다.`,
+    `할 일은 ${minTasks}~${maxTasks}개로 만든다. 기간과 설문 답에 맞는 정확한 개수는 네가 결정한다.`,
+    "JSON을 내기 전에 스스로 검증한다: 카드 주제와 목표에 직접 연결되는지, 필요한 과정이 빠지지 않았는지, 순서가 자연스러운지, 각 단계가 실제로 실행 가능한지 확인한다.",
     "다음 JSON 형태로만 답한다:",
-    '{"title":"프로젝트 제목(20자 이내)","category":"카테고리","keywords":["키워드"],"tasks":[{"content":"할 일 한 문장","suggested_when":"권장 시점(예: 첫째 날, 이번 주말)"}]}',
+    '{"title":"프로젝트 제목(20자 이내)","category":"카테고리","keywords":["키워드"],"task_count":5,"validation":{"card_aligned":true,"goal_aligned":true,"stages_complete":true,"summary":"카드 주제를 이해하고 적용·점검·기록까지 이어집니다."},"tasks":[{"content":"할 일 한 문장","suggested_when":"권장 시점(예: 첫째 날, 이번 주말)"}]}',
   ]
     .filter(Boolean)
     .join("\n");
@@ -161,7 +162,23 @@ Deno.serve(async (req: Request) => {
   }
 
   const tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
-  if (!tasks.length) return json({ error: "empty_tasks" }, 502);
+  const taskCount = Number(parsed.task_count);
+  const validation = parsed.validation as Record<string, unknown> | null;
+  if (!Number.isInteger(taskCount) || taskCount < minTasks || taskCount > maxTasks) {
+    return json({ error: "invalid_task_count" }, 502);
+  }
+  if (!validation?.card_aligned || !validation?.goal_aligned || !validation?.stages_complete) {
+    return json({ error: "agent_validation_failed" }, 502);
+  }
+  const checkedTasks = tasks.slice(0, maxTasks).map((t: Record<string, unknown>, i: number) => ({
+    content: String(t?.content ?? "").slice(0, 120).trim(),
+    suggested_when: String(t?.suggested_when ?? "").slice(0, 40).trim(),
+    position: i,
+  })).filter((t) => t.content.length > 0 && isSafeOutput(t.content, t.suggested_when));
+  const uniqueTasks = new Set(checkedTasks.map((t) => t.content.replace(/\s+/g, "").toLowerCase()));
+  if (checkedTasks.length !== taskCount || uniqueTasks.size !== taskCount) {
+    return json({ error: "invalid_task_plan" }, 502);
+  }
 
   return json({
     title: goal || String(parsed.title ?? "작은 시작 프로젝트").slice(0, 40),
@@ -170,11 +187,10 @@ Deno.serve(async (req: Request) => {
     keywords: Array.isArray(parsed.keywords)
       ? parsed.keywords.map(String).slice(0, 5)
       : [],
-    tasks: tasks.slice(0, taskCount).map((t: Record<string, unknown>, i: number) => ({
-      content: String(t?.content ?? "").slice(0, 120),
-      suggested_when: String(t?.suggested_when ?? "").slice(0, 40),
-      position: i,
-    })).filter((t: { content: string; suggested_when: string }) =>
-      t.content.length > 0 && isSafeOutput(t.content, t.suggested_when)),
+    validation: {
+      summary: String(validation.summary ?? "").slice(0, 160),
+      task_count: taskCount,
+    },
+    tasks: checkedTasks,
   });
 });

@@ -261,6 +261,11 @@ async function hydrateProjects() {
       const key = project.client_key;
       const tasks = (project.tasks || []).slice().sort((a, b) => a.position - b.position);
       store.aiTasks[key] = tasks.map((t) => t.content);
+      store.aiTaskPlans = store.aiTaskPlans || {};
+      store.aiTaskPlans[key] = tasks.map((t) => ({
+        content: t.content,
+        suggested_when: t.suggested_when || '',
+      }));
       store.aiTaskIds[key] = tasks.map((t) => t.id);
 
       // 오늘의 한 줄은 화면(taskNotes)과 연결 스트릭(checkins) 양쪽이 읽는다.
@@ -602,9 +607,9 @@ async function invoke(fn, body) {
 }
 
 /** F-PEBLKV · AI 프로젝트 생성 */
-async function generateProjectViaAI({ category, duration, goal, taskCount, survey, cards, days }) {
+async function generateProjectViaAI({ category, duration, goal, survey, cards, days }) {
   const data = await invoke('generate-project', {
-    category, duration, goal, taskCount, survey, cards, days,
+    category, duration, goal, survey, cards, days,
   });
   if (!data?.tasks?.length) return null;
   return data;
@@ -892,21 +897,69 @@ function surveyAnswers() {
  * 마무리 단계까지 AI 가 만들므로 단계 수와 할 일 수가 1:1 로 맞는다.
  */
 function applyStoredTasks() {
-  const saved = globalThis.Storage?.read?.()?.aiTasks || {};
+  const store = globalThis.Storage?.read?.() || {};
+  const saved = store.aiTasks || {};
+  const plans = store.aiTaskPlans || {};
   document.querySelectorAll('.separate-project').forEach((project) => {
-    const tasks = saved[project.dataset.projectKey];
+    const key = project.dataset.projectKey;
+    const tasks = plans[key] || saved[key]?.map((content) => ({ content, suggested_when: '' }));
     if (!Array.isArray(tasks) || !tasks.length) return;
+    project.querySelector('.project-agent-check')?.remove();
+    const validation = store.aiTaskValidation?.[key];
+    if (validation?.summary) {
+      const note = document.createElement('p');
+      note.className = 'project-agent-check';
+      note.textContent = `구성 확인 · ${validation.summary}`;
+      project.querySelector('.project-origin-preview')?.insertAdjacentElement('afterend', note);
+    }
     const rows = [...project.querySelectorAll('.independent-task')];
     if (!rows.length) return;
-    // 개수가 어긋나도 겹치는 만큼은 바꾼다. 예전에는 통째로 건너뛰어
-    // 하드코딩 문구가 그대로 노출됐다.
-    tasks.slice(0, rows.length).forEach((task, i) => {
-      const label = rows[i]?.querySelector('.independent-task-copy strong');
-      if (label) label.textContent = task;
-      rows[i]?.querySelector('.task-check')?.setAttribute('aria-label', `${task} 완료 표시`);
-    });
+    const list = rows[0].parentElement;
+    if (!list) return;
+    const template = rows[0].cloneNode(true);
+    list.replaceChildren(...tasks.map((task, i) => {
+      const row = template.cloneNode(true);
+      const content = String(task?.content || task || '').trim();
+      const when = String(task?.suggested_when || '').trim();
+      row.dataset.taskIndex = String(i);
+      row.classList.remove('completed', 'note-saved');
+      row.querySelector('.task-order').textContent = String(i + 1).padStart(2, '0');
+      row.querySelector('.independent-task-copy strong').textContent = content;
+      row.querySelector('.independent-task-copy small').textContent = when || `${i + 1}단계`;
+      row.querySelector('.task-date').textContent = when || `STEP ${i + 1}`;
+      const check = row.querySelector('.task-check');
+      check.setAttribute('aria-label', `${content} 완료 표시`);
+      check.setAttribute('aria-pressed', 'false');
+      const noteRow = row.querySelector('.task-note-row');
+      const input = noteRow?.querySelector('input');
+      const save = noteRow?.querySelector('button');
+      if (noteRow) noteRow.hidden = true;
+      check.onclick = () => {
+        const complete = row.classList.toggle('completed');
+        check.setAttribute('aria-pressed', String(complete));
+        if (noteRow) noteRow.hidden = !complete;
+        if (complete) input?.focus();
+      };
+      if (save && input) save.onclick = () => {
+        const note = input.value.trim();
+        if (!note) return input.focus();
+        const data = globalThis.Storage.read();
+        data.taskNotes = (data.taskNotes || []).filter((item) => !(item.project === key && item.task === i));
+        data.taskNotes.push({ project: key, task: i, date: new Date().toLocaleDateString('sv-SE'), note });
+        globalThis.Storage.write(data);
+        input.disabled = true;
+        save.disabled = true;
+        save.textContent = '완료';
+        row.classList.add('note-saved');
+      };
+      return row;
+    }));
   });
 }
+
+const taskPlanStyle = document.createElement('style');
+taskPlanStyle.textContent = `.project-agent-check{margin:0 10px 10px;padding:8px 10px;border-radius:11px;background:#f4f0fb;color:#654598;font-size:10px;font-weight:800;line-height:1.45}`;
+document.head.append(taskPlanStyle);
 
 /**
  * F-OVNIBD · 실시간 트렌드 기반 "키워드" 카드
@@ -964,12 +1017,54 @@ function attach() {
     // 원본은 카드함의 candidate 플래그를 세므로, 장기 관심 카드와 분리한 뒤에는
     // 0장으로 보였다. 여기서는 이번 실행의 프로젝트 카드만 보여 준다.
     label.textContent = `프로젝트 카드 ${count}장`;
-    label.setAttribute('role', 'status');
-    label.setAttribute('aria-live', 'polite');
-    label.removeAttribute('tabindex');
-    label.onclick = null;
-    label.onkeydown = null;
+    label.classList.add('project-card-count');
+    // 눌러서 어떤 카드를 골랐는지 보고 뺄 수 있어야 한다.
+    // 예전에는 여기서 role 을 status 로 바꾸고 핸들러를 지워 버려 시트가 열리지 않았다.
+    label.setAttribute('role', 'button');
+    label.setAttribute('tabindex', '0');
+    label.setAttribute('aria-label', `프로젝트 카드 ${count}장, 눌러서 고른 카드 보기`);
+    label.removeAttribute('aria-live');
+    label.onclick = openProjectCardSheet;
+    label.onkeydown = (event) => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); openProjectCardSheet(); }
+    };
   };
+
+  /** 이번에 고른 프로젝트 카드를 보여 주고, 후보에서 뺄 수 있게 한다. */
+  function openProjectCardSheet() {
+    globalThis.ensureCandidateSheet?.();
+    const content = document.querySelector('#candidateSheetContent');
+    if (!content) return;
+
+    const cards = Cloud.projectCards || [];
+    content.innerHTML = cards.length
+      ? `<div class="candidate-list">${cards.map((card) => {
+        const visual = (globalThis.Catalog?.categories || []).find((c) => c.name === card.category)
+          || (globalThis.Catalog?.categories || []).at(-1);
+        return `<article class="candidate-row" style="--candidate-color:var(--${visual.color})">
+          <i aria-hidden="true"></i>
+          <div><strong>${String(card.title || '').replace('\n', ' ')}</strong>
+          <small>${card.category} · 프로젝트 후보</small></div>
+          <button class="card-remove" type="button" data-drop="${card.id}"
+            aria-label="${card.title} 후보에서 빼기">후보에서 빼기</button>
+        </article>`;
+      }).join('')}</div>`
+      : '<div class="candidate-empty"><strong>아직 고른 카드가 없어요.</strong>'
+        + '<p>발견 탭에서 마음 가는 카드를 오른쪽으로 넘겨 보세요.</p></div>';
+
+    content.querySelectorAll('[data-drop]').forEach((button) => {
+      button.onclick = () => {
+        // 뺀 카드는 사라지지 않는다. 관심 카드함에 그대로 남는다.
+        Cloud.projectCards = (Cloud.projectCards || [])
+          .filter((card) => card.id !== button.dataset.drop);
+        syncCurrentProjectCards();
+        openProjectCardSheet();
+        globalThis.toast?.('카드는 관심 카드에 남겨두었어요.');
+      };
+    });
+
+    globalThis.openSheet?.('#candidateCardsSheet');
+  }
   const syncCurrentProjectCards = () => {
     const cards = Cloud.projectCards.map((card) => ({ ...card }));
     if (globalThis.state) globalThis.state.decisionLikes = cards;
@@ -1108,12 +1203,12 @@ function attach() {
     flow.innerHTML = `
       <div class="flow-top">
         <button class="flow-back" id="focusBack" type="button" aria-label="발견으로 돌아가기">‹</button>
-        <span class="flow-step">주제 좁히기</span>
+        <span class="flow-step">프로젝트 카드 선택</span>
       </div>
       <div class="flow-card">
         <p class="flow-kicker">고른 카드 ${cards.length}장</p>
-        <h2>지금 가장<br>끌리는 건 뭐예요?</h2>
-        <p class="sub">하나를 고르면 그 주제로 더 깊이 물어볼게요. 나머지는 관심 카드함에 그대로 있어요.</p>
+        <h2>프로젝트로 만들<br>카드 하나를 골라요.</h2>
+        <p class="sub">선택한 한 장만 설문·목표·할 일의 근거가 돼요. 나머지는 관심 카드함에 남아요.</p>
       </div>
       <div class="focus-list">
         ${cards.map((card, i) => `
@@ -1123,8 +1218,8 @@ function attach() {
             <small>${card.category}</small>
           </button>`).join('')}
       </div>
-      <button class="flow-primary" id="focusConfirm" type="button" disabled>주제를 골라 주세요</button>
-      <p class="flow-helper" id="focusHelper" role="status">고른 주제로 질문 6개를 만들어요.</p>`;
+      <button class="flow-primary" id="focusConfirm" type="button" disabled>프로젝트 카드를 골라 주세요</button>
+      <p class="flow-helper" id="focusHelper" role="status">선택한 카드 하나를 바탕으로 질문을 만들어요.</p>`;
 
     const confirm = flow.querySelector('#focusConfirm');
     let picked = null;
@@ -1138,8 +1233,12 @@ function attach() {
           other.setAttribute('aria-pressed', String(on));
         });
         confirm.disabled = false;
-        confirm.textContent = `‘${picked.title}’로 질문 받기`;
-        // 고르는 즉시 만들기 시작해, 버튼을 누를 땐 이미 준비돼 있게 한다.
+        confirm.textContent = `‘${picked.title}’로 프로젝트 구성하기`;
+        // 여기서 이번 프로젝트의 근거를 한 장으로 확정한다. 나머지 카드는 관심
+        // 카드함에 남아 다음 추천을 더 구체화할 때만 쓰인다.
+        const selected = Cloud.projectCards.find((card) => card.title === picked.title);
+        Cloud.projectCards = selected ? [selected] : [];
+        syncCurrentProjectCards();
         globalThis.state.decisionFocus = picked.title;
         prepareSurvey();
       };
@@ -1218,7 +1317,7 @@ function attach() {
         globalThis.state.decisionFocus = cards[0].title;
         return runSurvey();
       }
-      if (cards.length > 1 && Cloud.ai && renderFocusStep(() => runSurvey())) return;
+      if (cards.length > 1 && renderFocusStep(() => runSurvey())) return;
       return runSurvey();
     };
     // 버튼은 원본 함수를 '값'으로 붙잡고 있어서 위 교체가 반영되지 않는다. 다시 연결한다.
@@ -1802,8 +1901,9 @@ function attach() {
       const cards = runCards
         .filter((c) => c.category === pick.category)
         .map((c) => ({ title: String(c.title || '').replace('\n', ' '), intro: c.intro || '' }));
-      // 같은 분야의 이번 프로젝트 카드가 없다면, 관심 카드나 기본 표로 대신 만들지 않는다.
-      if (!cards.length) return null;
+      // 프로젝트는 고른 카드 한 장으로만 만든다. 하나가 아니면 관심 카드나 기본 표로
+      // 대신 만들지 않고 재시도 화면으로 돌려 보낸다.
+      if (cards.length !== 1) return null;
 
       const ai = await generateProjectViaAI({
         category: pick.category,
@@ -1812,9 +1912,6 @@ function attach() {
         cards,
         days: PERIOD_DAYS[period] || 7,
         goal: pick.goal?.[0],
-        // 카드의 단계 수는 Catalog.projects 의 항목 수(3)를 따른다. 개수가 어긋나면
-        // applyStoredTasks 가 적용을 건너뛰어 하드코딩 문구가 그대로 남는다.
-        taskCount: 3,
       });
       if (!ai?.tasks?.length) return null;
 
@@ -1837,13 +1934,19 @@ function attach() {
         projectKey: pick.key, // 완료 체크를 DB 행에 잇기 위한 키
         period,
       }, PERIOD_TO_DURATION[period] || '1주');
-      return [pick.key, ai.tasks.map((t) => t.content)];
+      return [pick.key, ai.tasks, ai.validation];
     }));
 
     const data = Storage.read();
     data.aiTasks = data.aiTasks || {};
+    data.aiTaskPlans = data.aiTaskPlans || {};
+    data.aiTaskValidation = data.aiTaskValidation || {};
     data.aiSourceCards = { ...(data.aiSourceCards || {}), ...sourceByKey };
-    results.filter(Boolean).forEach(([key, tasks]) => { data.aiTasks[key] = tasks; });
+    results.filter(Boolean).forEach(([key, tasks, validation]) => {
+      data.aiTasks[key] = tasks.map((task) => task.content);
+      data.aiTaskPlans[key] = tasks;
+      data.aiTaskValidation[key] = validation || null;
+    });
     Storage.write(data);
   }
 
