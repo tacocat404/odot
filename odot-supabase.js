@@ -339,25 +339,28 @@ function hydrateCardBox() {
   const liked = (store.reactions || []).filter((r) => r.type === 'like');
   if (!liked.length) return;
 
-  const usedWords = new Set([
-    ...(store.completedProjects || []).flatMap((p) => (p.sourceCards || []).map((c) => c.title)),
-    ...(store.activeProjects || []).map((p) => p.goal?.[0] || ''),
-  ].join(' ').split(/\s+/).filter(Boolean));
+  // 이미 이 기기에 카드함이 있으면 덮어쓰지 않는다. 사용자가 후보에서 뺀 상태가
+  // 남아 있고, 덮어쓰면 프로젝트 카드 집계가 어긋난다.
+  const existing = new Map((store.cardStore?.cards || []).map((c) => [c.id, c]));
 
   const cards = liked.map((r) => {
-    const title = Cloud.keywordBySlug.get(r.topicId) || r.topicId;
+    const kept = existing.get(r.topicId);
+    if (kept) return kept;
     return {
       id: r.topicId,
       category: r.category,
-      title,
+      title: Cloud.keywordBySlug.get(r.topicId) || r.topicId,
       intro: '',
       reason: `${r.category} · 관심 카드`,
-      candidate: !usedWords.has(title),
+      // 좋아요한 카드는 기본적으로 프로젝트 후보다. 빼는 건 사용자가 정한다.
+      candidate: true,
     };
   });
 
   store.cardStore = { version: store.cardStore?.version || 'interest-inbox-v1', cards };
   globalThis.Storage?.write?.(store);
+  globalThis.syncProjectCandidates?.();
+  globalThis.updateProjectCardCount?.();
 }
 
 /** 전역 시드 카드의 slug → id 매핑을 미리 받아 둔다. */
