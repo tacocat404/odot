@@ -614,11 +614,17 @@ async function invoke(fn, body) {
 
 /** F-PEBLKV · AI 프로젝트 생성 */
 async function generateProjectViaAI({ category, duration, goal, survey, cards, days }) {
-  const data = await invoke('generate-project', {
-    category, duration, goal, survey, cards, days,
-  });
-  if (!data?.tasks?.length) return null;
-  return data;
+  // AI 응답은 대체로 정상이어도 JSON 필드 하나가 빠지거나 네트워크가 잠깐
+  // 흔들릴 수 있다. 아직 어떤 프로젝트도 저장하지 않은 시점이므로 한 번 더
+  // 요청해도 중복 프로젝트가 생기지 않는다.
+  for (let attempt = 0; attempt < 2 && Cloud.ai; attempt += 1) {
+    const data = await invoke('generate-project', {
+      category, duration, goal, survey, cards, days,
+    });
+    if (data?.tasks?.length) return data;
+    if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 350));
+  }
+  return null;
 }
 
 /**

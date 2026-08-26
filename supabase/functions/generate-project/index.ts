@@ -162,21 +162,17 @@ Deno.serve(async (req: Request) => {
   }
 
   const tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
-  const taskCount = Number(parsed.task_count);
   const validation = parsed.validation as Record<string, unknown> | null;
-  if (!Number.isInteger(taskCount) || taskCount < minTasks || taskCount > maxTasks) {
-    return json({ error: "invalid_task_count" }, 502);
-  }
-  if (!validation?.card_aligned || !validation?.goal_aligned || !validation?.stages_complete) {
-    return json({ error: "agent_validation_failed" }, 502);
-  }
   const checkedTasks = tasks.slice(0, maxTasks).map((t: Record<string, unknown>, i: number) => ({
     content: String(t?.content ?? "").slice(0, 120).trim(),
     suggested_when: String(t?.suggested_when ?? "").slice(0, 40).trim(),
     position: i,
   })).filter((t) => t.content.length > 0 && isSafeOutput(t.content, t.suggested_when));
   const uniqueTasks = new Set(checkedTasks.map((t) => t.content.replace(/\s+/g, "").toLowerCase()));
-  if (checkedTasks.length !== taskCount || uniqueTasks.size !== taskCount) {
+  // 모델이 task_count 또는 validation의 자기평가를 빠뜨리는 경우가 있다.
+  // 실제로 저장할 할 일 목록을 서버가 직접 검사해야 일시적인 형식 편차가
+  // 프로젝트 생성 실패로 이어지지 않는다.
+  if (checkedTasks.length < minTasks || checkedTasks.length > maxTasks || uniqueTasks.size !== checkedTasks.length) {
     return json({ error: "invalid_task_plan" }, 502);
   }
 
@@ -188,8 +184,11 @@ Deno.serve(async (req: Request) => {
       ? parsed.keywords.map(String).slice(0, 5)
       : [],
     validation: {
-      summary: String(validation.summary ?? "").slice(0, 160),
-      task_count: taskCount,
+      summary: String(validation?.summary ?? "").slice(0, 160),
+      task_count: checkedTasks.length,
+      card_aligned: validation?.card_aligned === true,
+      goal_aligned: validation?.goal_aligned === true,
+      stages_complete: validation?.stages_complete === true,
     },
     tasks: checkedTasks,
   });
