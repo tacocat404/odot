@@ -954,9 +954,23 @@ function attach() {
    * 이번 프로젝트에는 현재 탐색 중 오른쪽으로 넘긴 카드만 들어간다. 이전 세션의
    * 후보 표시가 state.decisionLikes 로 되살아나는 몽키패치를 여기서 차단한다.
    */
+  const showProjectCardCount = () => {
+    const count = Cloud.projectCards.length;
+    const label = document.querySelector('#likedCount');
+    if (!label) return;
+    // 원본은 카드함의 candidate 플래그를 세므로, 장기 관심 카드와 분리한 뒤에는
+    // 0장으로 보였다. 여기서는 이번 실행의 프로젝트 카드만 보여 준다.
+    label.textContent = `프로젝트 카드 ${count}장`;
+    label.setAttribute('role', 'status');
+    label.setAttribute('aria-live', 'polite');
+    label.removeAttribute('tabindex');
+    label.onclick = null;
+    label.onkeydown = null;
+  };
   const syncCurrentProjectCards = () => {
     const cards = Cloud.projectCards.map((card) => ({ ...card }));
     if (globalThis.state) globalThis.state.decisionLikes = cards;
+    showProjectCardCount();
   };
   const demoteSavedCards = () => {
     const data = Storage.read();
@@ -1189,6 +1203,8 @@ function attach() {
 
     globalThis.startDecision = async () => {
       const cards = currentRunCards();
+      // 원본 렌더러가 카드함 후보로 state 를 덮었어도, 시작 직전에는 이번 카드만 쓴다.
+      syncCurrentProjectCards();
       globalThis.state.decisionFocus = null;
       Cloud.survey = null;
       Cloud.surveySignature = null;
@@ -1535,10 +1551,11 @@ function attach() {
 
     const startDecisionFromSwipe = () => {
       deckCard.style.transform = '';
-      if (!(globalThis.state?.decisionLikes || []).length) {
+      if (!currentRunCards().length) {
         globalThis.toast?.('마음 가는 카드를 한 장 이상 골라주세요.');
         return;
       }
+      syncCurrentProjectCards();
       globalThis.startDecision?.();
     };
 
