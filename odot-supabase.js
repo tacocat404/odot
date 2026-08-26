@@ -1004,6 +1004,9 @@ function applyStoredTasks() {
     const list = rows[0].parentElement;
     if (!list) return;
     const template = rows[0].cloneNode(true);
+    const completed = new Set(
+      (store.activeProjects || []).find((item) => item.key === key)?.done || [],
+    );
     list.replaceChildren(...tasks.map((task, i) => {
       const row = template.cloneNode(true);
       const content = String(task?.content || task || '').trim();
@@ -1020,12 +1023,17 @@ function applyStoredTasks() {
       const noteRow = row.querySelector('.task-note-row');
       const input = noteRow?.querySelector('input');
       const save = noteRow?.querySelector('button');
-      if (noteRow) noteRow.hidden = true;
+      const isComplete = completed.has(i);
+      row.classList.toggle('completed', isComplete);
+      check.setAttribute('aria-pressed', String(isComplete));
+      if (noteRow) noteRow.hidden = !isComplete;
       check.onclick = () => {
         const complete = row.classList.toggle('completed');
         check.setAttribute('aria-pressed', String(complete));
         if (noteRow) noteRow.hidden = !complete;
         if (complete) input?.focus();
+        storeTaskCompletion(key, i, complete);
+        refreshProjectCompletion(project);
       };
       if (save && input) save.onclick = () => {
         const note = input.value.trim();
@@ -1041,7 +1049,69 @@ function applyStoredTasks() {
       };
       return row;
     }));
+    refreshProjectCompletion(project);
+    bindProjectFinish(project);
   });
+}
+
+/** AI 할 일로 DOM 을 바꾼 뒤에도 하단 완료 수와 내보내기 버튼은 새 행을 기준으로 본다. */
+function refreshProjectCompletion(project) {
+  const tasks = [...project.querySelectorAll('.independent-task')];
+  const count = tasks.filter((task) => task.classList.contains('completed')).length;
+  const done = project.querySelector('.project-done');
+  if (done) done.textContent = String(count);
+
+  const finish = project.querySelector('.project-finish-btn');
+  const help = project.querySelector('.project-finish-help');
+  const ready = tasks.length > 0 && count === tasks.length;
+  if (finish) finish.disabled = !ready;
+  if (help) {
+    help.textContent = ready
+      ? '오늘까지의 작은 행동과 한 줄 기록을 마일스톤으로 남길 수 있어요.'
+      : `작은 행동 ${count} / ${tasks.length} 완료 · 모두 끝내면 마무리할 수 있어요.`;
+  }
+}
+
+/** 완료 상태를 다시 열어도 유지하도록 현재 프로젝트의 done 목록에도 반영한다. */
+function storeTaskCompletion(projectKey, index, completed) {
+  const data = globalThis.Storage?.read?.() || {};
+  const project = (data.activeProjects || []).find((item) => item.key === projectKey);
+  if (!project) return;
+  const done = new Set(project.done || []);
+  if (completed) done.add(index);
+  else done.delete(index);
+  project.done = [...done].sort((a, b) => a - b);
+  globalThis.Storage?.write?.(data);
+}
+
+/** 마무리 시 DB 프로젝트도 완료 처리해 다른 기기·새로고침 뒤에도 되살아나지 않게 한다. */
+async function markProjectArchived(projectKey) {
+  return safe('markProjectArchived', async () => {
+    const taskId = globalThis.Storage?.read?.()?.aiTaskIds?.[projectKey]?.[0];
+    if (!taskId) return;
+    const { data, error } = await Cloud.client
+      .from('tasks').select('project_id').eq('id', taskId).maybeSingle();
+    if (error || !data?.project_id) throw error || new Error('project_not_found');
+    const { error: updateError } = await Cloud.client
+      .from('projects')
+      .update({ completed_at: new Date().toISOString() })
+      .eq('id', data.project_id)
+      .eq('user_id', Cloud.userId);
+    if (updateError) throw updateError;
+  });
+}
+
+function bindProjectFinish(project) {
+  const finish = project.querySelector('.project-finish-btn');
+  if (!finish || finish.dataset.cloudBound) return;
+  finish.dataset.cloudBound = 'true';
+  finish.onclick = async () => {
+    if (finish.disabled) return;
+    finish.disabled = true;
+    await markProjectArchived(project.dataset.projectKey);
+    globalThis.archiveProjectFromCard?.(project);
+    void refreshLiveInsights();
+  };
 }
 
 const taskPlanStyle = document.createElement('style');
