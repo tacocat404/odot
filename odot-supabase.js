@@ -1241,9 +1241,14 @@ function attach() {
         card.innerHTML = busyCardHTML('다음 키워드를 고르는 중');
         startBusyCopyRotation(card);
         refreshUpcoming();
+        syncCurrentProjectCards();
         return;
       }
-      return baseRenderDeck(...args);
+      // 원본 renderDeck 은 카드함의 후보를 state.decisionLikes 에 다시 넣는다.
+      // react() 의 180ms 지연 렌더도 여기로 들어오므로, 매번 현재 실행의 카드로 복원한다.
+      const result = baseRenderDeck(...args);
+      syncCurrentProjectCards();
+      return result;
     };
   }
 
